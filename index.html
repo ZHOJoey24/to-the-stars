@@ -1,0 +1,2385 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>TO THE STARS</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #000; overflow: hidden;
+    font-family: Consolas, "Courier New", monospace;
+  }
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  /* 像素风关键：关闭浏览器插值，否则放大后像素会糊 */
+  #cv { display: block; background: #06070d; image-rendering: pixelated; image-rendering: crisp-edges; }
+  /* 注意：#hud 已在美术阶段删除 —— 游戏内 HUD 全部由画布像素字绘制（drawHudPixels）；
+     曾经同时存在 DOM HUD 与画布 HUD，两套文字会叠在一起，是已修复过的 bug。*/
+  /* 状态覆盖层（开始 / 暂停 / 结算）：
+     ============================ 这里出过一个严重 bug ============================
+     上一版字号写成 calc(0.177 * max(100vw, 177.78vh))，意图是「17px × cover 缩放系数」，
+     但 max(100vw, 177.78vh) 在 1077×593 窗口里 = max(1077, 1054) = **1077px**，
+     于是字号 = 0.177 × 1077 变成 **190px** —— 整个开始界面只剩几个巨大的中文字。
+     错在哪：我把「系数」写成了「视口长度」。要表达 17px × max(w/960, h/540)，
+     正确写法 CSS 里是 max(1.771vw, 3.148vh)（两个 vw/vh 项各带自己的系数）。
+     教训：这类算式**不要靠肉眼读代码判断**，离线 Canvas 桩也照不出来（它不渲染 DOM）。
+     现在的做法是双保险：
+       ① 这里在 CSS 只给一个**恒为正、绝不会失控**的兜底值（vmax 写法）；
+       ② resize() 里用 JS 按真实尺寸写入精确像素值（--ov-fs / --ov-big-fs）。
+     JS 一定比 calc 可靠，而且有真实视口尺寸可用，不需要在 CSS 里做视口数学。
+     另外 max-width 也改成按「可见宽度」算：cover 最坏可能只剩 607.5 逻辑像素，
+     overlay 是 700 逻辑像素 × scale，横向最多两侧各溢出 46 逻辑像素，
+     靠 padding 与留白吸收 —— 不会切到正文。*/
+  #overlay {
+    position: fixed; pointer-events: none;
+    left: 50%; top: 50%; transform: translate(-50%, -50%);
+    text-align: center;
+    color: #fff; text-shadow: 0 0 3px #000;
+    /* 兜底：即使 JS 没跑到，也只是「略小」，绝不会变成巨型字。
+       vmax 只用于兜底 —— 真正的字号由 resize() 写成精确像素值。*/
+    font-size: 17px;
+    font-size: min(4vmax, 34px);
+    line-height: 1.8;
+    max-width: 720px;
+    overflow-wrap: break-word;
+    background: rgba(0,0,0,.62); padding: 18px 26px;
+    white-space: pre-line;
+  }
+  #overlay.hidden { display: none; }
+  #overlay .big { font-size: 22px; font-size: min(5.2vmax, 44px); color: #ffd45a; }
+  /* 遥测面板：与游戏区分离，开启后暂停游戏，仅用于看数据与导出 */
+  #tel {
+    position: fixed; inset: 0; z-index: 10;
+    background: rgba(0,0,0,.93); color: #d8d8d8;
+    font-family: Consolas, "Courier New", monospace; font-size: 13px;
+    padding: 16px 20px; overflow: auto; display: none;
+  }
+  #tel.open { display: block; }
+  #tel h3 { margin: 0 0 6px; font-size: 15px; color: #fff; }
+  #tel table { border-collapse: collapse; margin-bottom: 12px; }
+  #tel th, #tel td { border: 1px solid #444; padding: 2px 7px; text-align: right; white-space: nowrap; }
+  #tel th { background: #1e1e1e; color: #9cd; }
+  #tel td.l, #tel th.l { text-align: left; }
+  #tel .ok { color: #7d7; }
+  #tel .warn { color: #fd7; }
+  #tel .bad { color: #f88; }
+  #tel .hint { color: #888; }
+  #tel .bar { display: flex; gap: 8px; margin-bottom: 12px; }
+  #tel button {
+    font-family: inherit; font-size: 13px; padding: 4px 12px; cursor: pointer;
+    background: #222; color: #ddd; border: 1px solid #666;
+  }
+  #tel button:hover { background: #333; }
+  #tel pre {
+    background: #111; border: 1px solid #333; padding: 8px;
+    max-height: 190px; overflow: auto; font-size: 11px; color: #9a9a9a;
+  }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="cv"></canvas></div>
+<div id="overlay"></div>
+<div id="tel"></div>
+
+<script>
+"use strict";
+
+/* =========================================================================
+   TO THE STARS —— 单文件像素风悬停跑酷（双击即玩）
+   事实来源就是这个文件；设计推导与踩坑记录见 游戏设计方案_V3.md 与 AGENTS.md。
+   美术全部程序化绘制（ASCII 像素精灵 + 算法生成天体/星云），音效走 Web Audio 合成，
+   零外部素材、零依赖 —— 这是《游戏编写要求》A2/A3 的硬约束，不要引入任何文件。
+   ========================================================================= */
+
+/* ------------------------------ 常量配置 ------------------------------ */
+const CFG = {
+  W: 960, H: 540,               // 逻辑分辨率 16:9
+
+  /* 物理（第十一轮反馈：重力过大、悬停时上下振幅过大）
+     **悬停振幅 = 单次跳跃顶点 apex** —— 这是恒等关系，不是近似：
+       按最优节奏点按时角色在 [悬停高度, 悬停高度 + apex] 之间往复，所以 apex 就是振幅。
+       旧值 apex = 80 → 振幅占起始区间（270）的 30%；中期区间收窄到 150 时占比过半，
+       这就是"中期很容易死亡"的直接来源。
+     本轮按"滞空 0.75 秒 + 顶点 40"联立反解：
+       滞空 = 2·V0/G = 0.75  ⇒  V0 = 0.375·G
+       顶点 = V0²/(2G) = 40  ⇒  V0 = √(80G)
+       联立得 0.140625·G² = 80G ⇒ G = 569、V0 = 213
+     结果：振幅 40（占屏高 7.4%，比旧值降低 50%），滞空 0.75 秒（旧 0.566 秒）。 */
+  G: 569,
+  V0: 213,
+
+  /* 开局高度与开局初速
+     · START_Y 决定可达上限 R = START_Y + apex，而起始区间有硬约束 gapHi ≤ R − 2·PH。
+       要让"振幅小(apex=40) + 起始区间大(240)"同时成立，必须把 START_Y 抬到 300 左右：
+       R = 340，则 gapHi ≤ 340 − 32 = 308，取 240 留足余量。
+     · START_V **必须小于 V0**：若用 START_V = V0，开局那一次跳跃会从 300 冲到 340，
+       再落到 300，幅度过大且贴到可行带上沿。改为刚好升到悬停舒适带中部的速度：
+       START_V = 400 时顶点 = 300 + 400²/(2×569) = 300 + 141 = 441，
+       而起始区间的上沿是 300 + 240 = 540 的一半左右，落在带内。
+     注：这条打破了之前"START_V == V0 保证零漂移"的设定 —— 现在开局会先下沉一小段再进入
+     稳定节奏，属于可接受的代价（换来的是开局不冲顶）。 */
+  START_Y: 300,
+  START_V: 400,
+
+  /* 角色体积（第三次要求更小）：碰撞盒与绘制尺寸严格一致，占屏高 3.3% */
+  PW: 16, PH: 16,
+  DRAW_W: 16, DRAW_H: 16,
+  PLAYER_X: Math.round(960 * 0.28),
+
+  /* 输入 */
+  DEBOUNCE: 0.08,               // 去抖，仅过滤意外双击
+  RESTART_LOCK: 0.6,            // 结算输入锁定期
+
+  /* 世界速度：**不再是难度主轴**（仅提供背景推进感）
+     第十轮改判：速度改为**按距离**爬升（见 currentSpeed()），因为反馈要求
+     "300m 达到难度上限" —— 只有把速度也挂在距离上，"难度达峰"与"速度达峰"
+     才会同时发生在 300m；否则时间轴上的速度爬升会在达峰后继续把后半程推快。
+     参数含义随之变为：SPD0 起步速度、SPD1 上限速度、
+     **SPD_RAMP 的单位从"秒"变成"米"**（= 300，见下方 DIFF_RAMP 的说明）。 */
+  SPD0: 180, SPD1: 340, SPD_RAMP: 300,
+
+  /* 难度爬升：缝隙、位置扫掠、组间距都按这个 k 同步收紧
+     ============================ 第十轮的核心改动 ============================
+     第九轮反馈："200m 之后难度已经很难（这个难度应该设为上限），
+     调整难度曲线使得游玩时间能提升。"
+     第十轮反馈："① 难度上限的可通过窗口最小比例下调至屏幕的 13%；
+     ② 要求在 300m 达到难度上限；③ 间隔密度基本没感受到随难度变化；
+     ④ 可通过区域基本都在屏幕下三分之二，上三分之一从没出现过。"
+
+     为什么把 k 从"时间线性"改成"**距离幂曲线**"：
+       反馈 ② 要求 300m 达峰。若只把时间轴上的 DIFF_RAMP 从 176 压到 182 秒，
+       那么难度会变成"前 100m 就冲到 0.55"—— 因为距离对时间是二次的
+       （dist ≈ 180t + 0.42t²），时间线性映射到距离上就是"先慢后快"再被截断，
+       前期陡、后期平，与"平滑爬到 300m"正相反。
+       改成"按距离取幂"后：k = (d / 300)^0.7 ——
+         50m → 0.26   100m → 0.42   200m → 0.68   300m → 1.00
+       前期爬得比旧曲线还缓，300m 处干净利落地达峰。
+
+     达峰后的一切都被冻结：k=1 时 gapH / gapT / sweep / speed 全部到顶，
+     391m 与 3000m 面对的玩法参数完全相同 —— 玩家能走多远只取决于自己。 */
+  DIFF_RAMP: 300,               // **单位：米**（不是秒）。达峰距离。
+  DIFF_POW: 0.7,                // k = (d / DIFF_RAMP)^DIFF_POW，幂次 < 1 让前期更缓
+
+  /* 摆动幅度：难度越高，缝隙位置摆得越远（**当前无引用**：位置摆幅由扫掠区间
+     [sLo2, sHi2] 自然决定，AMP0/AMP1 是更早一版架构的遗留，见 AGENTS §9 #2） */
+  AMP0: 0.45, AMP1: 1.0,
+
+  /* 可通过区间（第七轮的核心：区间是主角，障碍由区间反推）
+     GAP_HI → GAP_LO 是**唯一**的难度主轴：区间高度 270（屏高 50%）→ **70（屏高 13.0%）**
+
+     下限 70 的来历（第十轮反馈 ①："最小比例下调至屏幕的 13%"）：
+       · 13% × 540 = 70.2 → 取 70；
+       · 70 = 4.4 个身位、1.75 个跳跃振幅（apex 39.9）。对比历史值：
+         30（1.9 身位 / 0.75 振幅，当时是死局）、107（6.7 身位 / 2.7 振幅，被反馈"偏松"）；
+       · 70 落在__solvable_check.js 扫出的悬崖之上：cap=30 死、cap=50 起自动机存活，
+         所以它属于"能过但不宽裕"的档位。**改这个值必须重跑 __solvable_check.js**。
+
+     为什么"能过"与"好过"是两件事：悬停时角色本来就在 apex ≈ 40 的带里往复，
+     区间高度必须显著大于这个振幅才有容错。70 / 40 = 1.75 倍，属于刻意收紧。
+
+     （历史上还有一个 POS_RANGE 位置摆幅系数，第 15 轮已删除：它把低难度的位置摆幅
+       压到理论范围的 45%，是"区间总落在下半屏"的机制之一 —— 现在位置由模式机直接控制，
+       见下面 MOVE_* / JUMP_* / DENS_* 那一段。） */
+  GAP_HI: 270, GAP_LO: 70,
+  STEP_MAX: 40,                        // ⚠️ 第 15 轮起**生成器不再使用**（位置改由
+                                       // "模式机 + 预算反推"控制，见 generateObstacle 第 3 步）——
+                                       // 保留是因为 __rand_check.js 的"理论上限"一行还在引用，
+                                       // **不要以为调它能改变位置幅度**。
+  SWEEP0: 0.5, SWEEP1: 1.0,            // ⚠️ 同上，已不再被生成器引用
+
+  /* 单独障碍的参数已废弃 —— 第七轮起形态由"区间位置"自然决定，
+     不再需要单独的柱高/板底区间。以下两项保留给 PHYS 计算用。 */
+  WIN_JITTER: 10,               // 区间中心的随机抖动
+  GAP_MIN_PX: 70,               // 区间高度硬下限（必须 == GAP_LO，否则会把难度上限夹回去）
+  START_FLAT: 3,                // 开局前几个障碍保持最低难度
+  GAP_JIT: 0.06,                // 缝高的每组抖动（±6%）：难度曲线不变，但读起来不再等宽
+
+  /* ---- 位置「模式机」与密度「呼吸」（第 15 轮） ----
+     ============================ 第 15 轮的核心修正 ============================
+     反馈原话："可通过区域还是很规律的上下浮动，柱子的密度间距也是十分均匀。
+                没有任何的突变下坠和上升，游玩比较单调和可预测。"
+
+     ★ 第 11 轮的随机化只做到"小步 + 偶尔反向"（单步 12~54、翻转 18%），
+       那在统计上确实"随机"，但对玩家来说**局部永远是平滑的**：
+       相邻两组的落差只有 0.1~0.3 个缝高，看不到任何"事件"。
+       **随机 ≠ 有起伏** —— 这是本轮最重要的一句。
+
+     所以把位置拆成三种模式，而且**幅度由本组的真实时间预算反推**（物理上必然做得到）：
+
+       hold   原地停留  24%  —— 制造喘息，让突变有对比（全是突变等于没有突变）
+       drift  小步跟进  42%  —— 连续性的底噪，幅度 = 0.35~0.75 × 本组能爬的高度
+       jump   突变      34%  —— 幅度按**缝高**给：向上 0.9~1.8 倍、向下 1.5~3.2 倍，
+                                再用预算上限夹住；并且**成串**（同向 2~4 组），
+                                玩家体验到的才是"一路俯冲"而不是原地抖动。
+
+     ★ 上/下不对称是有物理依据的，不是为了好看：
+         上升只能靠反复点按 ⇒ 净速率 apex/滞空 ≈ 53.3 单位/秒 ⇒ 1.3s 预算只够 ~55 单位；
+         下降是自由落体      ⇒ √(2Δ/G)              ⇒ 同样预算能掉 ~150 单位。
+       于是"俯冲可以很猛、拉起来必须给足组数"——这正是玩家要的"突变下坠"的物理来源。
+
+     ★ 密度同理：间距不再是常数，而是 burst / normal / rest 三种"呼吸"
+       （连紧 2~3 组 → 送一个长间隔），玩家感到的是"一阵紧、一口气"，而不是均匀排队。 */
+  MOVE_HOLD_P: 0.24, MOVE_JUMP_P: 0.34,   // 停留 / 突变 的概率（其余为 drift）
+  DRIFT_LO: 0.35, DRIFT_HI: 0.75,         // drift 幅度 = 该系数 × 本组能爬的高度
+  JUMP_UP_LO: 0.9, JUMP_UP_HI: 1.8,       // 上突变幅度 = 该系数 × 缝高（再被预算夹住）
+  JUMP_DN_LO: 1.5, JUMP_DN_HI: 3.2,       // 下突变幅度 = 该系数 × 缝高（再被预算夹住）
+  DIVE_MAX: 200,                          // 单次俯冲的绝对上限（像素）
+  SAFE_CLIMB: 0.85, SAFE_FALL: 0.55,      // 预算安全系数：只用到预算的这一部分
+  TREND_P: 0.55, TREND_RUN: 3,            // 突变成串的概率 / 最长段
+  DENS_BURST: 0.80, DENS_REST: 1.45, DENS_JIT: 0.10,   // 密度呼吸的极端系数与普通抖动
+  /* ★ 呼吸必须**均值守恒**：burst 的组数占比（0.30×2.5 = 0.75）比 rest（0.25×2.5 = 0.625）
+     更大，所以"紧 20% / 松 45%"平均下来是**净变松 +6.8%** —— 那就是偷偷改难度（实测均值
+     从 440 涨到 470）。这个系数把它拉回来，`__rand_check.js` 会断言"均值因子 ≈ 1.00"。 */
+  DENS_FIX: 0.936,
+
+  /* 组间距：**密度必须同时收紧"时间"与"像素"两个维度**
+     ============================ 第十轮的核心修正 ============================
+     第十轮反馈 ③："障碍物的间隔密度距离在游玩时基本没有感受到随难度变化。"
+
+     这不是感觉问题，是**公式问题**。间距的取值是
+         spacing = max(speed × gapTime, pxFloor)
+     而速度从 180 涨到 340（×1.63）、时间间距从 2.4s 收到 1.3s（×0.54），
+     两者**几乎完全抵消**：实测像素间距 515px → 538px（不降反升）。
+     玩起来就是"障碍变远了"而不是"越来越密"。
+
+     ★ 关键认知（第十轮实测出来的，别再绕）：
+        `max()` 里的下限只能**抬高**间距、不能压低它。
+        所以"像素下限"若低于速度项，它就等于没写；旧值 320 就是这样失效的。
+        要让密度随难度上升，下限必须**全程高于速度项**，并且自己随难度递减。
+        我一度把下限降到 220 想"让密度收紧"，结果速度项（459~583）完全接管，
+        间距反而从 523px 涨到 589px —— 方向搞反了。
+
+     最终标定：pxFloor 从 440 收到 320，且全程 ≥ 速度项（180×2.4 = 432 ~ 340×1.3 = 442）
+        k=0  max(432, 440) = **440px**  → 屏内约 2.2 组
+        k=1  max(442, 320) = **442px** … 仍由速度项接管，只比前段宽 0.5%
+     也就是说：像素间距基本被"钉"在 440 附近，**"越来越密"必须靠时间维度表达** ——
+     组与组的**相遇频率**（= speed / spacing）反而真在上升：0.41 → 0.77 组/秒（+88%），
+     加上速度本身 ×1.63（屏幕滚动更快、障碍掠过更快），
+     合起来才是玩家能感知的"密度在涨"。`GAP_PX_MIN` 是硬地板护栏，正常不触发。 */
+  GAP0: 2.4, GAP1: 1.3, GAP_MIN: 1.3,
+  GAP_PX0: 440, GAP_PX1: 320,   // 像素间距下限：随难度 440 → 320（全程高于速度项，因此真正生效）
+  GAP_PX_MIN: 250,              // 硬地板：任何情况下两组不得比这更近（护栏，正常不触发）
+  REACT: 0.35,
+
+  /* 生成前置量 */
+  LEAD_MIN: 120,                // 前瞻距离下限（像素）
+  LEAD_TIME: 0.5,               // 额外预留的观察时间
+
+  OW_MIN: 45, OW_MAX: 110,      // 障碍物宽度
+  SPAWN_MARGIN: 40,             // 生成点在屏幕右侧之外的距离
+  FIRST_DELAY: 620,             // 首个障碍物额外延迟
+
+  /* 计分 */
+  PX_PER_M: 100,
+
+  /* 像素放大倍数：精灵每个像素放大为 PIXEL 个逻辑单位。
+     2 表示飞船在屏幕上占 32×32 逻辑像素（视觉），而碰撞盒仍是 16×16。
+     **注意：DRAW_W/DRAW_H 必须继续等于 PW/PH**，否则"视觉 == 碰撞"这条铁律会破，
+     玩家会重现早期"看着撞到了却没死"的问题。 */
+  PIXEL: 3,
+
+  DT: 1 / 120,                  // 固定物理步长（帧率无关）
+  MAX_FRAME: 0.25,              // 单帧时间截断（防切标签页后瞬移）
+
+  /* HUD 安全区（单位：逻辑像素，从画布左右边缘内缩）
+     画布用 cover 方式铺满窗口，横向会被裁掉一部分：
+       scale = max(winW/960, winH/540)，可见宽度 = winW/scale ≤ 960
+     最坏情况是竖屏或窄窗口（winW/winH = 0.5625）
+       → scale = 540/winH，可见宽度 = 0.5625 × 2 × 540 = 607.5（只裁掉两侧各 176）
+     而 1920×1080 时可见宽度已经是满 960。
+     所以任何贴边的 HUD（原来难度条右边缘在 x=946）在窄窗口下都会被裁掉，
+     必须把 HUD 全部限制在这个安全区内 —— 这是"难度条被右边缘切掉"的根因。 */
+  HUD_SAFE: 280,
+  HUD_PAD: 18,                  // 安全区内再留一点呼吸
+
+  REASONS: {
+    ceiling:  "跳太高，撞到顶部了",
+    obstacle: "撞上障碍物了",
+    floor:    "掉得太低，触底了"
+  }
+};
+
+/* 由物理参数派生的关键高度（避免出现手写常数与公式不一致） */
+const PHYS = {
+  APEX: CFG.V0 * CFG.V0 / (2 * CFG.G),          // 单次抛物线顶点
+  AIR: 2 * CFG.V0 / CFG.G,                      // 单次滞空
+  HOVER: 0,                                     // READY 悬停高度 = 开局高度（不再是顶点）
+  PILLAR_CEIL: 0,                               // 柱顶硬上限 = 顶点 − 角色高
+  MAX_PLAYER_TOP: 0                             // 在开局高度起跳能到达的最高 py
+};
+PHYS.HOVER = CFG.START_Y;
+PHYS.PILLAR_CEIL = PHYS.APEX - CFG.PH;
+PHYS.MAX_PLAYER_TOP = CFG.START_Y + PHYS.APEX;
+
+/** 天花板块下边缘的硬性上限：
+    若高于"玩家从开局高度起跳能到达的最高点 + 角色高"，玩家不动也能飞过去，
+    这种障碍没有任何约束意义。生成器必须按此夹取。 */
+PHYS.CEIL_CAP_MAX = PHYS.MAX_PLAYER_TOP - 1;
+
+/* ===== 两种独立障碍的合法区间（这是本轮简化的核心）=====
+   早期把柱与板绑成"闸门"共享一个窗口定义，产生了四个互相耦合的约束
+   （柱高上限 / 板底下限 / 窗口下界 / 可达高度），我反复配平都漏项，
+   最终让生成器彻底失效。现在退回为**两个完全独立的障碍**：
+     地面柱：只有一条约束 —— 玩家从最低可能位置起跳也能越过
+     悬顶块：只有一条约束 —— 玩家即使跳到最高也还在它下方（必须下落才能通过）
+   两者不共享任何变量，因此不会互相挤压。 */
+PHYS.LOWEST_Y = 0;                       // 玩家可能处于的最低高度
+PHYS.PT_HI = 0;                          // 柱顶硬上限（跳得过去）
+PHYS.PB_LO = 0;                          // 板底硬下限（容得下、玩家能到它下面）
+PHYS.PB_HI = 0;                          // 板底硬上限（真的挡得住玩家）
+
+/* 玩家可能的最低位置：
+   · 开局时就是起始高度；
+   · 之后他可能一路下坠到接近地面（触底即死，所以最低留一个身位）。
+   柱顶必须让玩家从**这个最低位置**起跳也能越过，否则他低位时必死。 */
+PHYS.LOWEST_Y = CFG.PH + 2;                                   // 玩家可能的最低位置
+/* 柱顶硬上限：越过柱顶需要 py ≥ pt + PH，而玩家从最低位置起跳能到达 LOWEST_Y + apex，
+   故 pt + PH ≤ LOWEST_Y + apex − 余量。 */
+PHYS.PT_HI = Math.max(10, PHYS.LOWEST_Y + PHYS.APEX - CFG.PH - 8);
+/* 板底硬下限：必须能容下一个身位，且玩家能到达它下方 */
+PHYS.PB_LO = CFG.PH * 2 + 30;
+/* 板底硬上限：必须低于"玩家可达最高点 + 一个身位"，否则玩家站在最高处也撞不到它，
+   板子形同虚设。留 4 单位余量避免刚好擦边。 */
+PHYS.PB_HI = Math.max(PHYS.PB_LO + 20, PHYS.MAX_PLAYER_TOP - 4);
+
+/* ===== 成对障碍（上下夹逼）的硬约束 =====
+   成对障碍 = 同一水平位置上的地面柱 + 悬顶块，两者之间形成窄缝。
+   玩家要穿过必须同时满足：
+     ① py ≥ 柱顶 + PH          （脚在柱子上方）
+     ② py ≤ 板底 − PH          （头在板子下方）
+     ⇒ 缝隙宽度 = 板底 − 柱顶 − 2·PH ≥ GAP
+     ⇒ 柱顶 ≤ 板底 − GAP − 2·PH          这是柱顶被板底反向限制的那条约束
+   另一条独立约束：板底 ≤ 可达上限，否则玩家从上方飞过、板子形同虚设。
+   这两条一起把"柱顶可用的高度范围"压缩得很窄 —— 这正是前几轮我卡住的地方。 */
+PHYS.PAIR_PT_HI = 0;
+PHYS.PAIR_PB_HI = 0;
+
+/* 柱顶上限（反推障碍时用来夹取）：
+   唯一要求是"玩家从最低位置起跳也能越过" ⇒ 柱顶 + PH ≤ START_Y + apex − 余量。
+   注意不再需要"缝隙放得下"那条 —— 因为区间是先定的，障碍由区间反推，天然相容。 */
+PHYS.PAIR_PT_HI = Math.max(0, PHYS.MAX_PLAYER_TOP - CFG.PH - 8);
+/* 板底上限：必须 ≤ 可达上限，否则玩家从上方飞过去、板子形同虚设。
+   留 4 单位余量，并要求板底比屏幕顶低 40（否则板子太薄、看不出是障碍） */
+PHYS.PAIR_PB_HI = Math.min(CFG.H - 40, PHYS.MAX_PLAYER_TOP - 4);
+
+
+/* ------------------------------ 像素精灵 ------------------------------
+   像素风的最小实现：把 ASCII 图解析成像素网格，绘制时逐格 fillRect。
+   好处 —— 不需要任何外部图片文件，因此不破坏"单页面 + 零依赖"两条硬约束。
+
+   飞船：机头朝右（与前进方向一致）。**内容严格填满 16×16，无透明边距**，
+   因此"视觉尺寸 == 碰撞体积"这条铁律自动成立（详见下方 drawShip 的注释）。
+   色号：. 透明  1 轮廓  2 主体  3 高光  4 座舱  5 尾焰 */
+const SHIP_MAP = [
+  "................",
+  "................",
+  "................",
+  ".......11.......",
+  "......1331......",
+  "......13311.....",
+  "..1111231111111.",
+  ".122222224422331",
+  "1552222224422331",
+  ".122222222222331",
+  "..1111231111111.",
+  "......13311.....",
+  "......1331......",
+  ".......11.......",
+  "................",
+  "................",
+];
+
+/* 无尾焰版本：用于尾焰闪烁动画（两帧交替） */
+const SHIP_MAP_NOFLAME = SHIP_MAP.map(r => r[0] === "5" ? "." + r.slice(1) : r);
+
+/* 调色板（纯宇宙风）：深色轮廓 / 蓝色主体 / 青色高光 / 暖黄座舱 / 橙色尾焰 */
+const SHIP_PAL = {
+  "1": [16, 20, 44],
+  "2": [70, 132, 214],
+  "3": [162, 220, 252],
+  "4": [255, 200, 88],
+  "5": [255, 126, 60],
+};
+
+/** 把 ASCII 图解析为像素网格：grid[y][x] = [r,g,b] 或 null */
+function makeSprite(map, pal) {
+  const h = map.length, w = map[0].length;
+  const grid = [];
+  for (let y = 0; y < h; y++) {
+    const row = [];
+    for (let x = 0; x < w; x++) row.push(pal[map[y][x]] || null);
+    grid.push(row);
+  }
+  return { w, h, grid };
+}
+
+/** 绘制精灵：以 (px, py) 为左上角，每个像素放大为 CFG.PIXEL 个逻辑单位 */
+function drawSprite(sp, px, py) {
+  const S = CFG.PIXEL;
+  for (let y = 0; y < sp.h; y++) {
+    const gy = py + y * S;
+    if (gy + S < 0 || gy > CFG.H) continue;
+    for (let x = 0; x < sp.w; x++) {
+      const c = sp.grid[y][x];
+      if (!c) continue;
+      const gx = px + x * S;
+      if (gx + S < 0 || gx > CFG.W) continue;
+      ctx.fillStyle = "rgb(" + c[0] + "," + c[1] + "," + c[2] + ")";
+      ctx.fillRect(gx, gy, S, S);
+    }
+  }
+}
+
+const SHIP = makeSprite(SHIP_MAP, SHIP_PAL);
+const SHIP_NOFLAME = makeSprite(SHIP_MAP_NOFLAME, SHIP_PAL);
+
+/* ------------------------------ 像素字体 ------------------------------
+   美术阶段给 HUD 换成像素字，避免"矢量字 + 像素画"的割裂感。
+   当前只覆盖数字与少量符号；缺字回退为空格（宁可缺字也不崩）。
+   字形用 **5×7** 点阵。先前试过 3×5，但在 2 倍放大下笔画会粘连、几乎读不出，
+   5×7 是像素字体里最常用的最小可读尺寸。字符间距 1，故步进为 6×S。 */
+const FONT5x7 = {
+  "0": ["01110","10001","10011","10101","11001","10001","01110"],
+  "1": ["00100","01100","00100","00100","00100","00100","01110"],
+  "2": ["01110","10001","00001","00010","00100","01000","11111"],
+  "3": ["11111","00010","00100","00010","00001","10001","01110"],
+  "4": ["00010","00110","01010","10010","11111","00010","00010"],
+  "5": ["11111","10000","11110","00001","00001","10001","01110"],
+  "6": ["00110","01000","10000","11110","10001","10001","01110"],
+  "7": ["11111","00001","00010","00100","01000","01000","01000"],
+  "8": ["01110","10001","10001","01110","10001","10001","01110"],
+  "9": ["01110","10001","10001","01111","00001","00010","01100"],
+  ".": ["00000","00000","00000","00000","00000","01100","01100"],
+  ":": ["00000","01100","01100","00000","01100","01100","00000"],
+  "-": ["00000","00000","00000","11111","00000","00000","00000"],
+  "/": ["00001","00010","00010","00100","01000","01000","10000"],
+  "%": ["11001","11010","00010","00100","01000","01011","10011"],
+  "!": ["00100","00100","00100","00100","00100","00000","00100"],
+  "?": ["01110","10001","00001","00110","00100","00000","00100"],
+  " ": ["00000","00000","00000","00000","00000","00000","00000"],
+  /* ---- 大写字母（5×7）---- 先前只定义了数字与符号，
+     导致 HUD 里的 "BEST" "DIFFICULTY" 等字母全部渲染为空。 */
+  "A": ["01110","10001","10001","11111","10001","10001","10001"],
+  "B": ["11110","10001","10001","11110","10001","10001","11110"],
+  "C": ["01110","10001","10000","10000","10000","10001","01110"],
+  "D": ["11110","10001","10001","10001","10001","10001","11110"],
+  "E": ["11111","10000","10000","11110","10000","10000","11111"],
+  "F": ["11111","10000","10000","11110","10000","10000","10000"],
+  "G": ["01110","10001","10000","10111","10001","10001","01111"],
+  "H": ["10001","10001","10001","11111","10001","10001","10001"],
+  "I": ["01110","00100","00100","00100","00100","00100","01110"],
+  "J": ["00111","00010","00010","00010","00010","10010","01100"],
+  "K": ["10001","10010","10100","11000","10100","10010","10001"],
+  "L": ["10000","10000","10000","10000","10000","10000","11111"],
+  "M": ["10001","11011","10101","10101","10001","10001","10001"],
+  "N": ["10001","11001","10101","10011","10001","10001","10001"],
+  "O": ["01110","10001","10001","10001","10001","10001","01110"],
+  "P": ["11110","10001","10001","11110","10000","10000","10000"],
+  "Q": ["01110","10001","10001","10001","10101","10010","01101"],
+  "R": ["11110","10001","10001","11110","10100","10010","10001"],
+  "S": ["01111","10000","10000","01110","00001","00001","11110"],
+  "T": ["11111","00100","00100","00100","00100","00100","00100"],
+  "U": ["10001","10001","10001","10001","10001","10001","01110"],
+  "V": ["10001","10001","10001","10001","10001","01010","00100"],
+  "W": ["10001","10001","10001","10101","10101","11011","10001"],
+  "X": ["10001","10001","01010","00100","01010","10001","10001"],
+  "Y": ["10001","10001","01010","00100","00100","00100","00100"],
+  "Z": ["11111","00001","00010","00100","01000","10000","11111"],
+};
+
+/** 用像素字体写字。scale 为像素放大倍数，px/py 是左上角（画布坐标） */
+function drawText(str, px, py, scale, color, align) {
+  const s = scale || 2;
+  const chars = String(str).toUpperCase().split("");
+  const cw = 6 * s;                                  // 5 宽 + 1 间距
+  const total = chars.length * cw - s;
+  let x0 = px;
+  if (align === "right") x0 = px - total;
+  else if (align === "center") x0 = px - Math.round(total / 2);
+  ctx.fillStyle = color;
+  for (let ci = 0; ci < chars.length; ci++) {
+    const g = FONT5x7[chars[ci]] || FONT5x7[" "];
+    for (let ry = 0; ry < 7; ry++) for (let rx = 0; rx < 5; rx++) {
+      if (g[ry][rx] !== "1") continue;
+      ctx.fillRect(x0 + ci * cw + rx * s, py + ry * s, s, s);
+    }
+  }
+  return total;
+}
+function textWidth(str, scale) {
+  const s = scale || 2;
+  return String(str).length * 6 * s - s;
+}
+
+/* ------------------------------ 音效（程序化合成） ------------------------------
+   不引入任何音频文件。AudioContext 必须懒初始化于首次用户交互之后
+   （浏览器自动播放策略），初始化失败则静默降级为无声。 */
+const Sfx = {
+  ac: null, muted: false,
+  init() {
+    if (this.ac) return;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) this.ac = new AC();
+    } catch (e) { this.ac = null; }
+  },
+  /** 简单包络音：freq 起始频率、slide 结束频率、dur 时长秒、type 波形 */
+  tone(freq, slide, dur, type, vol) {
+    if (this.muted) return;
+    this.init();
+    if (!this.ac) return;
+    try {
+      const t = this.ac.currentTime;
+      const o = this.ac.createOscillator(), g = this.ac.createGain();
+      o.type = type || "square";
+      o.frequency.setValueAtTime(freq, t);
+      if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(30, slide), t + dur);
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(vol || 0.08, t + 0.008);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g); g.connect(this.ac.destination);
+      o.start(t); o.stop(t + dur + 0.02);
+    } catch (e) { /* 静默降级 */ }
+  },
+  jump()    { this.tone(420, 760, 0.10, "square", 0.07); },   // 上扬：有效跳跃
+  invalid() { this.tone(150, 90, 0.10, "sawtooth", 0.05); },  // 低沉：早按无效（必须与跳跃明显区分）
+  hit()     { this.tone(180, 40, 0.35, "sawtooth", 0.10); },  // 撞击
+};
+
+/* ------------------------------ 星空（三层视差） ------------------------------
+   星星用确定性伪随机生成，存"世界坐标"，绘制时按视差系数滚动并取模循环。
+   用确定性而不是 Math.random，是为了每局星图一致（视觉稳定，便于对比）。 */
+const STARS = [];
+(function buildStars() {
+  const rnd = (function (seed) {                     // 线性同余，确定性
+    let s = seed >>> 0;
+    return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+  })(20260915);
+  const LAYERS = [
+    { n: 120, par: 0.15, size: 1, col: [ 96, 116, 168], tw: 0.4 },  // 远景：暗、小、慢
+    { n:  70, par: 0.42, size: 2, col: [150, 178, 232], tw: 0.7 },  // 中景
+    { n:  36, par: 1.00, size: 2, col: [232, 244, 255], tw: 1.2 },  // 主景：亮、快
+  ];
+  for (const L of LAYERS) {
+    for (let i = 0; i < L.n; i++) {
+      STARS.push({
+        x: rnd() * CFG.W, y: rnd() * CFG.H, par: L.par,
+        size: L.size + (rnd() < 0.18 ? 1 : 0),
+        col: L.col, tw: L.tw, ph: rnd() * Math.PI * 2,
+      });
+    }
+  }
+})();
+
+/* ------------------------------ 粒子系统 ------------------------------ */
+const PARTS = [];
+function spawnParticle(x, y, vx, vy, life, col, size) {
+  if (PARTS.length > 260) return;                    // 上限保护
+  PARTS.push({ x, y, vx, vy, life, max: life, col, size: size || 2 });
+}
+/** 推进粒子。dt 与游戏状态无关，任何状态下都推进（避免暂停时粒子冻结得突兀） */
+function updateParticles(dt) {
+  for (let i = PARTS.length - 1; i >= 0; i--) {
+    const p = PARTS[i];
+    p.x += p.vx * dt;
+    p.y -= p.vy * dt;                                // vy 以"向上为正"，画布是向下为正
+    p.vy -= 260 * dt;                                // 一点重力
+    p.life -= dt;
+    if (p.life <= 0) PARTS.splice(i, 1);
+  }
+}
+function drawParticles() {
+  for (const p of PARTS) {
+    const k = p.life / p.max;
+    // 随时间变暗（像素风：不做 alpha 混合，直接按比例压暗颜色）
+    const r = Math.round(p.col[0] * k), g = Math.round(p.col[1] * k), b = Math.round(p.col[2] * k);
+    ctx.fillStyle = "rgb(" + r + "," + g + "," + b + ")";
+    ctx.fillRect(Math.round(p.x), Math.round(p.y), p.size, p.size);
+  }
+}
+
+
+/* --------------------------- 工具函数 --------------------------- */
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp  = (a, b, t) => a + (b - a) * t;
+
+/** "#rrggbb" → [r,g,b]。像素风与程序化绘制里到处都要用，
+    而这些地方一律是**手算混色**（不用 ctx.globalAlpha），
+    因为离线渲染桩不认识 globalAlpha，手算才能保证"离线 == 浏览器"。 */
+function hexToRgb(h) {
+  return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+}
+
+/** 平滑往复波（相位步长不再是 0.5，因此会连续扫过整个区间而不只取端点） */
+function oscWave(s) {
+  return 0.5 - 0.5 * Math.cos(2 * Math.PI * (((s % 1) + 1) % 1));
+}
+
+/** 从高度 h0 起跳，首次达到 h1 所需时间；h1 高于可达顶点则返回 Infinity */
+function climbTime(h0, h1) {
+  if (h1 <= h0) return 0;
+  const disc = CFG.V0 * CFG.V0 - 2 * CFG.G * h0;
+  if (disc <= 0) return Infinity;                        // 已在顶点，无法再升高
+  const disc2 = CFG.V0 * CFG.V0 - 2 * CFG.G * h1;
+  if (disc2 < 0) return Infinity;                        // 超过顶点，物理不可达
+  if (disc2 === 0) return Math.sqrt(disc) / CFG.G;       // 目标恰为顶点（浮点可能正好落在 0）
+  return (Math.sqrt(disc) - Math.sqrt(disc2)) / CFG.G;
+}
+
+/** 自由落体从 h0 降到 h1 的时间 */
+function fallTime(h0, h1) {
+  return h1 >= h0 ? 0 : Math.sqrt(2 * (h0 - h1) / CFG.G);
+}
+
+/** 从区间 [a0,a1] 内任一高度迁移到区间 [b0,b1] 内任一高度所需的最小时长 */
+function migrateTime(a0, a1, b0, b1) {
+  return Math.max(climbTime(a0, b1), fallTime(a1, b0));
+}
+
+
+/* ------------------------------ 全局状态 ------------------------------ */
+const ST = { READY: 0, PLAYING: 1, PAUSED: 2, OVER: 3 };
+
+const G = {
+  state: ST.READY,
+  camera: 0, speed: CFG.SPD0, elapsed: 0,
+  py: PHYS.HOVER, vy: 0,
+  lastInputAt: -1, invalidFlash: 0,
+  obstacles: [], nextSpawnDist: 0,
+  lastObstacle: null, constrainedEdge: 0, obstacleCount: 0, sweepStep: 0,
+  score: 0, lastScore: 0, best: 0, reason: "", lockUntil: 0,
+  corPhase: 0,
+  gaps: []                       // 逐组记录真实相遇间隔；**目前只写不读**（没有消费者，
+                                 // 不构成约束，也不参与生成 —— 见 AGENTS §9 #2 的死代码清单）
+};
+
+
+/* ------------------------------ 存储模块 ------------------------------ */
+const Store = {
+  KEY: "hover_runner_best_v1",
+  read() {
+    try {
+      const n = Number(localStorage.getItem(this.KEY));
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    } catch (e) { return 0; }                 // 隐私模式等场景静默降级
+  },
+  write(v) {
+    try { localStorage.setItem(this.KEY, String(v)); } catch (e) { /* 静默降级 */ }
+  }
+};
+
+/* ======================================================================
+   遥测模块（Play Data Telemetry）
+   目的：把"凭推断调参"改成"凭数据调参"。
+    · 逐局采集：存活时长、失败原因、点按节律、无效点按（早按）、按高度分布、与障碍的最小间隔
+    · 自动诊断：把数据翻译成"该调哪个参数、往哪调"的结论
+    · 一键导出：H 打开面板 → 导出 JSON（只含汇总，不含逐帧采样，体积极小）
+   ====================================================================== */
+const Telemetry = {
+  KEY: "hover_runner_plays_v1",
+  MAX_RUNS: 200,                 // 本地最多保留多少局
+  SAMPLE_HZ: 8,                  // 高度采样频率
+  TARGET: { mash: 0.35, invalid: 0.30, pass: 0.70, minRuns: 4, shortRun: 8.0, rampT: 60 },
+
+  session: { sessionId: "", startedAt: "", config: null, runs: [] },
+  cur: null,
+
+  /* ---------- 配置快照：调参后历史数据仍可对照 ----------
+     注意：这里引用的 CFG 键**必须真实存在**。旧版快照引用了 windowRange / winCenter /
+     winSpan / minChange / spireLo… 等键，它们是更早一版闸门架构的遗留、在 CFG 里
+     早就不存在了 —— 结果 H 面板标题行会直接显示 "柱顶=undefined→undefined"。
+     改这里时顺手对一遍 CFG 的键名。 */
+  configSnapshot() {
+    return {
+      V0: CFG.V0, G: CFG.G,
+      apex: +PHYS.APEX.toFixed(1), air: +PHYS.AIR.toFixed(3),
+      startY: CFG.START_Y, startV: CFG.START_V,
+      PW: CFG.PW, PH: CFG.PH,
+      diffRampM: CFG.DIFF_RAMP, diffPow: CFG.DIFF_POW,
+      cap13: CFG.GAP_LO, gapHi: CFG.GAP_HI, gapMinPx: CFG.GAP_MIN_PX, gapJit: CFG.GAP_JIT,
+      move: [CFG.MOVE_HOLD_P, CFG.MOVE_JUMP_P], jumpUp: [CFG.JUMP_UP_LO, CFG.JUMP_UP_HI],
+      jumpDn: [CFG.JUMP_DN_LO, CFG.JUMP_DN_HI], diveMax: CFG.DIVE_MAX,
+      dens: [CFG.DENS_BURST, CFG.DENS_REST],
+      gapTime: [CFG.GAP0, CFG.GAP1], gapPx: [CFG.GAP_PX0, CFG.GAP_PX1], gapPxMin: CFG.GAP_PX_MIN,
+      sweep: [CFG.SWEEP0, CFG.SWEEP1], stepMax: CFG.STEP_MAX,   // 已不参与生成，仅留档
+      speed: [CFG.SPD0, CFG.SPD1], speedRampM: CFG.SPD_RAMP
+    };
+  },
+
+  load() {
+    try {
+      const raw = localStorage.getItem(this.KEY);
+      if (raw) {
+        const d = JSON.parse(raw);
+        if (d && Array.isArray(d.runs)) {
+          this.session.sessionId = d.sessionId || this.newId();
+          this.session.startedAt = d.startedAt || new Date().toISOString();
+          this.session.runs = d.runs;
+        }
+      }
+    } catch (e) { /* 本地存储不可用则仅内存记录 */ }
+    if (!this.session.sessionId) {
+      this.session.sessionId = this.newId();
+      this.session.startedAt = new Date().toISOString();
+    }
+  },
+  save() {
+    try { localStorage.setItem(this.KEY, JSON.stringify(this.session)); } catch (e) { /* 静默降级 */ }
+  },
+  newId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 6); },
+
+  /* ---------- 逐局记录 ---------- */
+  startRun() {
+    const now = nowSec();
+    this.cur = {
+      id: this.newId(),
+      endedAt: "", duration: 0, distance: 0, reason: "",
+      taps: 0, invalid: 0, frames: 0, framesNoTap: 0, ceilingTime: 0,
+      passed: 0, lastPassedAt: 0,
+      firstReaction: null,
+      minGap: { spire: null, plate: null },
+      heights: [], lastSample: 0
+    };
+  },
+
+  /* 每个物理步长调用一次：点按谱 + 高度采样 */
+  sample(dt) {
+    const c = this.cur; if (!c) return;
+    c.frames++;
+    if (c.framesNoTap > 1200 && c.firstReaction === null) c.firstReaction = G.elapsed;
+    if (G.py + CFG.PH > CFG.H - Math.max(80, PHYS.APEX * 0.6)) c.ceilingTime += dt;
+    if (G.elapsed - c.lastSample >= 1 / this.SAMPLE_HZ) {
+      c.lastSample = G.elapsed;
+      c.heights.push(Math.round(G.py));
+    }
+  },
+
+  onTap(ok) {              // 生效的点按 / 极快的重复点按
+    const c = this.cur; if (!c) return;
+    if (ok) { c.taps++; c.framesNoTap = 0; }
+    else c.invalid++;
+  },
+
+  onPass(obs) {            // 通过一个闸门
+    const c = this.cur; if (!c) return;
+    c.passed++;
+    c.lastPassedAt = G.elapsed;
+    // 记录通过瞬间与上下两侧约束的最小间隙（负值 = 判定上已经贴住）
+    const gapLow = G.py - CFG.PH - obs.pillarTop;          // 碰撞盒底与柱顶的间隙
+    const gapUp = obs.plateBottom - (G.py + CFG.PH);       // 碰撞盒顶与板底的间隙
+    if (c.minGap.spire === null || gapLow < c.minGap.spire) c.minGap.spire = Math.round(gapLow);
+    if (c.minGap.plate === null || gapUp < c.minGap.plate) c.minGap.plate = Math.round(gapUp);
+  },
+
+  finishRun() {
+    const c = this.cur; if (!c) return;
+    c.endedAt = new Date().toISOString();
+    c.duration = +G.elapsed.toFixed(3);
+    c.distance = +G.score.toFixed(1);
+    c.reason = G.reason || "";
+    c.heights = c.heights.slice(0, 4000);
+    const m = this.computeMetrics(c);
+    const run = {
+      id: c.id, endedAt: c.endedAt, date: c.endedAt.slice(0, 16).replace("T", " "),
+      duration: c.duration, distance: c.distance, reason: c.reason,
+      taps: c.taps, invalid: c.invalid, passRate: m.passRate,
+      mashRate: m.mashRate, invalidRate: m.invalidRate, avgHeight: m.avgHeight,
+      lowRatio: m.lowRatio, ceilingRatio: m.ceilingRatio,
+      minGapSpire: c.minGap.spire, minGapPlate: c.minGap.plate,
+      firstReaction: c.firstReaction === null ? null : +c.firstReaction.toFixed(2),
+      heights: c.heights, diagnosis: m.verdicts
+    };
+    this.session.runs.push(run);
+    if (this.session.runs.length > this.MAX_RUNS) {
+      this.session.runs.splice(0, this.session.runs.length - this.MAX_RUNS);
+    }
+    this.cur = null;
+    this.save();
+    return run;
+  },
+
+  /* ---------- 指标计算 ---------- */
+  computeMetrics(c) {
+    const dur = Math.max(0.001, c.duration);
+    const heights = c.heights;
+    const avg = heights.length ? heights.reduce((a, b) => a + b, 0) / heights.length : 0;
+    const sorted = heights.slice().sort((a, b) => a - b);
+    const med = sorted.length ? sorted[Math.floor(sorted.length / 2)] : 0;
+    return {
+      tapsPerSec: c.taps / dur,
+      mashRate: c.taps / Math.max(1, c.taps + c.invalid),
+      invalidRate: c.invalid / Math.max(1, c.taps + c.invalid),
+      passRate: c.passed / Math.max(1, c.passed + 1),          // 通过数 vs 遭遇数（遭遇 = 通过 + 最后撞到的那个）
+      passed: c.passed,
+      avgHeight: Math.round(avg),
+      medHeight: med,
+      lowRatio: heights.length ? heights.filter(h => h < 60).length / heights.length : 0,
+      ceilingRatio: c.ceilingTime / dur,
+      maxHeight: sorted.length ? sorted[sorted.length - 1] : 0,
+      firstReaction: c.firstReaction,
+      dur: c.duration,
+      verdicts: this.diagnose(c, { avg })
+    };
+  },
+
+  /* ---------- 自动诊断：把数据翻译成参数调整方向 ---------- */
+  diagnose(c, m) {
+    const T = this.TARGET, d = Math.max(0.001, c.duration);
+    const total = Math.max(1, c.taps + c.invalid);
+    const mashRate = c.taps / total, invalidRate = c.invalid / total;
+    const passed = c.passed, passRate = passed / Math.max(1, passed + 1);
+    const v = [];
+    const isCeil = c.reason === CFG.REASONS.ceiling;
+    const isFloor = c.reason === CFG.REASONS.floor;
+    const isObs = c.reason === CFG.REASONS.obstacle;
+    // 阈值随物理参数走，避免调参后诊断失效
+    const apex = PHYS.APEX, hover = PHYS.HOVER;
+    const lowLine = Math.round(Math.min(60, hover * 0.3));        // 贴底线
+    const ceilLine = CFG.H - Math.round(Math.max(80, apex * 0.6)); // 贴顶线
+    const floorMinTaps = 0.9 * (CFG.G / (2 * CFG.V0));            // 维持高度所需的最低点按频率
+
+    /* 结论 1：失败归因 → 跳跃能力是强了还是弱了 */
+    if (isCeil && invalidRate >= T.invalid) {
+      v.push({ level: "bad", text: "撞顶，且 " + (invalidRate * 100).toFixed(0) + "% 的点按快到没生效（间隔 <0.08s）—— " +
+        "典型的狂点硬扛。跳跃能力偏强：建议 v0 −8%~−12% 或 g +5%~+8%（等效于压低顶点）" });
+    } else if (isCeil) {
+      v.push({ level: "warn", text: "因撞顶失败，且没有狂点行为（未生效点按占 " + (invalidRate * 100).toFixed(0) +
+        "%）—— 说明是控高失误而非乱按。若多局都如此，建议提高顶部边界容差或略微降低 apex" });
+    } else if (isFloor) {
+      if (c.taps / d < floorMinTaps) {
+        v.push({ level: "bad", text: "因触底失败，且点按频率仅 " + (c.taps / d).toFixed(2) +
+          " 次/秒（维持高度约需 " + floorMinTaps.toFixed(2) + " 次/秒）—— 跟不上节奏。" +
+          "跳跃能力偏弱或下落过快：建议 v0 +8%~+15%，或 g −5%~−10%" });
+      } else {
+        v.push({ level: "warn", text: "因触底失败但点按频率正常（" + (c.taps / d).toFixed(2) +
+          " 次/秒）—— 说明是节奏被打断。若反复出现，检查单次下落距离是否过大（apex 偏高）" });
+      }
+    } else if (isObs) {
+      if (passRate < T.pass && passed <= 3) {
+        v.push({ level: "bad", text: "早期就被障碍物撞死（仅通过 " + passed + " 个）—— 开局难度偏高：" +
+          "建议把 GOPEN 的开局柱高/板底再放宽，或把难度爬升从 120s 拉长到 180s" });
+      } else {
+        v.push({ level: "warn", text: "撞到障碍物（已通过 " + passed + " 个）—— 属于正常的读牌失误；" +
+          "若这种死法占比超过一半，可考虑把 REACT 余量从 0.4s 提到 0.5s" });
+      }
+    }
+
+    /* 结论 2：未生效点按比例 → 玩家是否在狂点
+       注：本作的"按早了"不会让按键失效，只会在物理上损失高度（那是设计的一部分，
+       无法从按键层面观测）。这里能观测到的"未生效点按"只有一种：
+       两次点按间隔 < 0.08s，第二次因去抖/速度未回落而被吞掉 —— 即手抖双击或狂点。 */
+    if (invalidRate >= T.invalid) {
+      v.push({ level: "bad", text: "有 " + (invalidRate * 100).toFixed(0) + "% 的点按快到没生效（间隔 <0.08s）—— " +
+        "玩家在狂点硬扛高度。建议降低 apex，让「点快」不再等价于「升得快」" });
+    } else if (invalidRate < 0.1 && c.taps > 4) {
+      v.push({ level: "ok", text: "点按全部生效（未生效占 " + (invalidRate * 100).toFixed(0) +
+        "%）—— 操作干脆，没有狂点行为" });
+    }
+
+    /* 结论 3：通过率 → 障碍密度是否合适 */
+    if (passed >= 6) {
+      if (passRate >= T.pass) v.push({ level: "ok", text: "障碍通过率 " + (passRate * 100).toFixed(0) + "% —— 生成器难度与玩家水平匹配" });
+      else v.push({ level: "warn", text: "障碍通过率仅 " + (passRate * 100).toFixed(0) + "% —— 偏难：建议把组间距下限从 1.0s 提到 1.15s" });
+    }
+
+    /* 结论 4：高度分布 → 玩家实际在用哪段空间 */
+    const lowRatio = c.heights.length ? c.heights.filter(h => h < lowLine).length / c.heights.length : 0;
+    if (lowRatio > 0.5) {
+      v.push({ level: "warn", text: (lowRatio * 100).toFixed(0) + "% 的时间贴在屏幕底部（<" + lowLine + "）—— " +
+        "说明玩家几乎不点按。若同时触底频繁，问题在节奏而非跳跃力" });
+    }
+    const ceilRatio = c.ceilingTime / d;
+    if (ceilRatio > 0.25) {
+      v.push({ level: "warn", text: (ceilRatio * 100).toFixed(0) + "% 的时间待在顶部 " +
+        (CFG.H - ceilLine) + " 单位内 —— 玩家在贴顶飞行，天花板几乎失去威慑力：建议降低 apex" });
+    }
+    return v;
+  },
+
+  /* ---------- 会话级汇总（供改进决策） ---------- */
+  sessionSummary() {
+    const rs = this.session.runs;
+    if (!rs.length) return null;
+    const n = rs.length;
+    const sum = k => rs.reduce((a, r) => a + (r[k] || 0), 0);
+    const med = arr => { const a = arr.slice().sort((x, y) => x - y); return a.length ? a[Math.floor(a.length / 2)] : 0; };
+    const reasonCount = {};
+    rs.forEach(r => { const key = r.reason || "未知"; reasonCount[key] = (reasonCount[key] || 0) + 1; });
+    const durMed = med(rs.map(r => r.duration));
+    const durSorted = rs.map(r => r.duration).sort((a, b) => a - b);
+
+    const agg = {
+      runs: n,
+      durMed: +durMed.toFixed(1),
+      durMax: +durSorted[durSorted.length - 1].toFixed(1),
+      distMed: +med(rs.map(r => r.distance)).toFixed(1),
+      distMax: Math.max(...rs.map(r => r.distance)).toFixed(1),
+      tapsPerSec: +(sum("taps") / Math.max(1, sum("duration"))).toFixed(2),
+      tapTotal: sum("taps"),
+      invalidTotal: sum("invalid"),
+      passTotal: sum("passed"),
+      passTotalSum: rs.reduce((a, r) => a + r.passed + 1, 0),
+      reasonCount,
+      avgHeights: rs.map(r => r.avgHeight)
+    };
+    agg.invalidRate = agg.invalidTotal / Math.max(1, agg.tapTotal + agg.invalidTotal);
+    agg.mashRate = agg.tapTotal / Math.max(1, agg.tapTotal + agg.invalidTotal);
+    agg.passRate = agg.passTotal / Math.max(1, agg.passTotal + n);
+    agg.avgHeight = Math.round(agg.avgHeights.reduce((a, b) => a + b, 0) / n);
+    agg.gapSpire = med(rs.map(r => r.minGapSpire).filter(x => x !== null && x !== undefined).concat([999]));
+    agg.gapPlate = med(rs.map(r => r.minGapPlate).filter(x => x !== null && x !== undefined).concat([999]));
+
+    const v = [];
+    const T = this.TARGET;
+    const ceilN = reasonCount[CFG.REASONS.ceiling] || 0;
+    const floorN = reasonCount[CFG.REASONS.floor] || 0;
+    const obsN = reasonCount[CFG.REASONS.obstacle] || 0;
+
+    if (n >= T.minRuns) {
+      if (durMed < T.shortRun) {
+        v.push({ level: "bad", text: "存活中位数仅 " + agg.durMed + "s（" + n + " 局）—— 整体偏难。" +
+          "按性价比排序：① 把难度爬升 120s → 180s；② 组间距下限 1.0s → 1.2s；③ 降低 apex" });
+      }
+      if (ceilN >= n * 0.4) {
+        v.push({ level: "bad", text: ceilN + "/" + n + " 局死于撞顶 —— 纵向空间不足或跳跃过强。" +
+          "建议 v0 −10%（apex 从 " + PHYS.APEX.toFixed(0) + " 降到约 " + (PHYS.APEX * 0.81).toFixed(0) + "）" });
+      }
+      if (floorN >= n * 0.4) {
+        v.push({ level: "bad", text: floorN + "/" + n + " 局死于触底 —— 下落太快或节奏跟不上。" +
+          "建议 g −15%（下落距离不变但反应时间变长），或 v0 +10%" });
+      }
+      if (agg.invalidRate >= T.invalid) {
+        v.push({ level: "bad", text: "累计有 " + (agg.invalidRate * 100).toFixed(0) +
+          "% 的点按快到没生效 —— 玩家习惯狂点硬扛。降低 apex 是唯一有效的对策（让点快的收益变小）" });
+      }
+      if (agg.passRate < T.pass && agg.passTotal > 0) {
+        v.push({ level: "warn", text: "障碍通过率 " + (agg.passRate * 100).toFixed(0) + "% —— 偏难，优先加大组间距而非降低障碍高度" });
+      }
+      const rampFull = rs.filter(r => r.duration >= T.rampT).length;
+      if (rampFull >= 2 && durMed >= T.shortRun) {
+        v.push({ level: "ok", text: "有 " + rampFull + " 局活过了 60s 难度爬升段 —— 难度曲线本身站得住" });
+      }
+      if (ceilN <= n * 0.25 && floorN <= n * 0.25 && agg.invalidRate < 0.15 && durMed >= 25) {
+        v.push({ level: "ok", text: "失败分布均匀、无狂点行为、存活中位数 " + agg.durMed + "s —— 当前参数配平良好，可以进入美术阶段" });
+      }
+      if (agg.gapSpire > 90 && agg.gapPlate > 90) {
+        v.push({ level: "warn", text: "与障碍的最小间隙中位数都超过 90（柱 " + agg.gapSpire + " / 板 " + agg.gapPlate +
+          "）—— 玩家余量过大，可适当提高柱顶或压低板底来收紧" });
+      }
+    } else {
+      v.push({ level: "warn", text: "样本仅 " + n + " 局，结论不可靠。建议先玩满 " + T.minRuns + " 局以上再看" });
+    }
+    agg.verdicts = v;
+    return agg;
+  },
+
+  /* ---------- 导出（只含汇总，不含逐帧采样） ---------- */
+  exportPayload() {
+    const compact = this.session.runs.map(r => {
+      const o = {}; for (const k in r) if (k !== "heights") o[k] = r[k]; return o;
+    });
+    return JSON.stringify({
+      schema: "hover-runner-telemetry/1",
+      exportedAt: new Date().toISOString(),
+      session: { sessionId: this.session.sessionId, startedAt: this.session.startedAt },
+      config: this.session.config || this.configSnapshot(),
+      summary: this.sessionSummary(),
+      runs: compact
+    }, null, 2);
+  }
+};
+
+
+/* ------------------------------ 画布适配 ------------------------------ */
+const cv = document.getElementById("cv");
+const ctx = cv.getContext("2d");
+const overlayEl = document.getElementById("overlay");
+
+/** 宇宙尺度处理：把画布等比放大到铺满窗口。
+    横向多出的部分被裁掉（左右各裁一点）—— 对"飞船在太空中"的题材来说，
+    全屏星空比上下留黑边更贴合，代价只是可见横向范围略小（游戏区从 960 缩到 960/1.777=540 宽，
+    而角色固定在 28% 处、障碍从右侧进入，因此完全不影响玩法）。 */
+function resize() {
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  const scale = Math.max(window.innerWidth / CFG.W, window.innerHeight / CFG.H);   // cover 等比
+  /* 窗口最小化时 innerWidth/innerHeight 都是 0 ⇒ scale = 0 ⇒ visW = 0/0 = NaN，
+     于是 maxWidth 被写成 "NaNpx"（第 16 轮审查实测）。CSS 会忽略非法值所以没炸，
+     但"算出来是 NaN"本身就不该存在 —— 直接跳过这次 resize，等窗口恢复时自然会再来一次。 */
+  if (!(scale > 0)) return;
+  cv.style.width = Math.round(CFG.W * scale) + "px";
+  cv.style.height = Math.round(CFG.H * scale) + "px";
+  cv.width = Math.round(CFG.W * dpr);
+  cv.height = Math.round(CFG.H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+
+  /* 覆盖层字号与限宽：**在这里用 JS 写精确像素值**，不用 CSS 里的视口数学。
+     原因见 #overlay 上方那段注释 —— CSS 的 calc + max(100vw, 177.78vh) 写法
+     把"系数"错当成了"视口长度"，在 1077×593 下算出 190px 的巨型字。
+     JS 手里就有真实窗口尺寸和 scale，直接乘就完了，没有任何歧义。
+
+     两个上界，谁小取谁：
+       · 720 逻辑像素 —— 宽屏上不让文字横铺到大半个屏幕，保持阅读宽度；
+       · 可见宽度 − 20 —— cover 最坏可见 960×540 的 0.5625 倍宽
+         （竖屏 900×1600 只剩 304 逻辑像素），不夹住就会横向溢出。
+     这里刻意**不去测量文字自然宽度**：那样在 1920 宽屏上反而会把限宽压到 300 出头、
+     让本来一行放得下的文案被迫折行（实测踩过）。固定 720 更好预期。 */
+  if (overlayEl && overlayEl.style) {
+    const fs = clamp(17 * scale, 13, 46);
+    overlayEl.style.fontSize = fs.toFixed(1) + "px";
+    const big = overlayEl.querySelector(".big");
+    if (big) big.style.fontSize = (fs * 1.3).toFixed(1) + "px";
+    const visW = Math.min(CFG.W, window.innerWidth / scale);
+    overlayEl.style.maxWidth = Math.max(120, Math.min(720, visW - 20)).toFixed(0) + "px";
+  }
+}
+window.addEventListener("resize", resize);
+
+/* ------------------------------ 难度曲线 ------------------------------ */
+
+/** 世界速度：**按距离**爬升（第十轮改判，原为按时间）
+ *  为什么必须挂在距离上：反馈要求"300m 达到难度上限"，而速度如果还按时间涨，
+ *  就会在难度达峰之后继续把后半程推快 —— 那不是"达峰后冻结"，是"偷偷还在变难"。
+ *  SPD_RAMP 的单位因此是**米**（= DIFF_RAMP = 300）。 */
+const currentSpeed = m => lerp(CFG.SPD0, CFG.SPD1, clamp(m / CFG.SPD_RAMP, 0, 1));
+
+/* ---- 难度曲线 ---- */
+/** 难度系数 k：**按距离取幂**，而不是按时间线性
+ *
+ *  第十轮的重新设计（三条反馈联立的结果）：
+ *    · 反馈"300m 达到难度上限" ⇒ k(300) = 1，达峰距离必须可控；
+ *    · 若沿用"时间线性 + 压缩周期"，因为 dist ≈ 180t + 0.42t²（距离对时间是二次的），
+ *      时间线性映射到距离上会变成"前 100m 就冲到 0.55"，前期陡、后期平 —— 与期望相反；
+ *    · 取幂 k = (m / DIFF_RAMP)^DIFF_POW，幂次 0.7 < 1，让前期**更缓**、后段收得干净：
+ *        50m → 0.26   100m → 0.42   200m → 0.68   300m → 1.00
+ *  达峰之后 k 恒为 1：缝隙、扫掠、组间距全部冻结，玩家面对的是恒定的最高难度。 */
+const difficulty = m => Math.pow(clamp(m / CFG.DIFF_RAMP, 0, 1), CFG.DIFF_POW);
+
+/** 生成器用的难度：开局前几个障碍强制保持最低难度，给玩家适应期。
+ *  用硬阈值而不是原来的 k × (n/START_FLAT)：后者会把整个难度曲线在开局压成
+ *  线性起步（等于偷偷改掉了曲线形状），而且 k 现在按距离算、乘法会让前 3 组一直是 0。 */
+function genDifficulty() {
+  if ((G.obstacleCount || 0) < CFG.START_FLAT) return 0;
+  return difficulty(G.score);
+}
+
+/* ------------------------------ 生成器（闸门模型） ------------------------------ */
+/**
+ * 生成一个"闸门"障碍，替代旧的单侧障碍。
+ *
+ * 反馈"障碍都是单向的、一直在上下上下反复、没有节奏和难度变化"——
+ * 根因是旧生成器每次只施加一个约束（要么逼你爬升、要么逼你下降），
+ * 于是"上下交替"是被结构决定死的，且通过区永远是无限大的半边空间。
+ *
+ * 闸门模型：每个障碍由**下界**（地面柱顶）与**上界**（悬顶块下边缘）共同定义，
+ * 通过区是一个真正的窗口 [yMin, yMax]。于是：
+ *   · 窗口高度可连续调节 → 难度可以真正地"变窄"
+ *   · 窗口位置可自由漂移 → 节奏不再被硬编码的交替决定
+ *   · 同时约束上下两侧 → 玩家不能再靠"永远待在高处"或"永远待在地面"蒙混
+ *
+ * 物理硬边界（由 v0/g/START_Y 派生，全部集中判定，不靠调参碰运气）：
+ *   REACH_TOP = START_Y + apex                玩家能到达的最高位置
+ *   yMax ≤ REACH_TOP − 1                      上界必须真的挡得住玩家
+ *   floor ≤ fromY + apex                      玩家必须能跳进窗口（上界不能太高）
+ *   pillarTop ≤ REACH_TOP − PH                柱顶必须能跳过去
+ *   gap ≥ PH                                  窗口必须容得下角色
+ */
+function generateObstacle() {
+  const k = genDifficulty();                          // 含开局适应期
+  const gapTime = Math.max(CFG.GAP_MIN, lerp(CFG.GAP0, CFG.GAP1, k));
+  const prev = G.lastObstacle;
+  const hasPrev = !!prev;
+  const prevC = hasPrev ? (prev.pillarTop + CFG.PH + prev.plateBottom - CFG.PH) / 2 : CFG.START_Y;
+
+  /* ===== 可通过区间为主，障碍为辅（第七轮架构重定）=====
+     反馈原话："把逻辑重新定为设置可通过区间的位置和大小，算完之后障碍的上下夹逼
+     还是只有上或者只有下就自然确定了，而不是先专注于障碍的设置再关注可通过区间。"
+     这正是前期反复失败的根因：我一直在"先摆障碍、再看能否通过"，
+     于是约束互相打架。现在完全颠倒过来：
+
+       第 1 步：按难度算出可通过区间 —— 中心 c 与高度 g（g 是难度的主要表达）
+       第 2 步：把区间夹到"玩家真的能到"的范围里（可达上限、角色高、屏幕范围）
+       第 3 步：**由区间反推障碍**：
+                 下界障碍（地面柱）= 区间下沿之下 → 柱顶 = 区间下沿 − PH
+                 上界障碍（悬顶块）= 区间上沿之上 → 板底 = 区间上沿 + PH
+       第 4 步：若某一侧落到屏幕外，该侧障碍自动消失（夹逼 → 单侧）
+                —— "只有上"或"只有下"是区间位置的**自然结果**，不需要单独判断
+
+     这样既保证了区间一定可通过，也让"上下夹逼 / 单侧"成为位置的自然产物。 */
+
+  /* --- 第 1 步：按难度取区间 --- */
+  const gLo = CFG.GAP_LO, gHi = CFG.GAP_HI;
+  /* 缝高加 ±6% 抖动：难度曲线本身不变（仍按距离单调收紧），
+     但"每个缝都一样宽"这件事消失了 —— 玩家报的"均匀"有一半来自这里。 */
+  const gapH = clamp(lerp(gHi, gLo, k) * (1 + (Math.random() * 2 - 1) * CFG.GAP_JIT),
+    CFG.GAP_MIN_PX, gHi);
+  const half = gapH / 2;
+  const jit = (Math.random() * 2 - 1) * CFG.WIN_JITTER;
+
+  /* --- 第 2 步：算出区间下沿 s 的可行范围 ---
+     s = 玩家脚的最低容忍高度；区间 = [s, s+gapH]
+     约束只有两条：
+       ① s ≥ PH                             柱顶不能为负
+       ② s + gapH ≤ H − PH                  区间上沿不能顶出屏幕
+     ============================ 第十轮的修正 ============================
+     反馈原话："感觉可通过区域基本都集中在屏幕的下三分之二范围内，
+     上三分之一基本没有区域生成；见过贴地的区域，但没有见过贴顶区域。"
+
+     查证：旧代码的扫描上界是
+         sHi2 = min(R − 8, H − gapH − PH, R − gapH − PH)      R = MAX_PLAYER_TOP
+     第三项恒为最小值 ⇒ sHi2 = R − gapH − PH = 324 − gapH，
+     于是**区间中心的最高位置 = 324 − gapH/2**：k=0 时 189（屏高 35%），
+     k=1 时 254（47%）—— 上三分之一（>360）**永远不可能出现区间**。
+
+     错在哪：第三项的本意是"板底要挡得住玩家"，但它比真实可达上限**多减了一个 gapH**。
+     玩家在悬停后可以起跳，顶点是 R = START_Y + apex ≈ 340，而且**可以在 340 以下的
+     任意高度稳定悬停**（点对同一高度反复点按即可维持）。所以可达的最高"脚位"就是 R。
+
+     修正：把第三项换掉，但**必须保留第二项**（屏幕上沿约束）：
+         sHi2 = min(R − 8, H − gapH − PH)
+     为什么第二项不能省（我第一次改错的地方，记下以免重蹈）：
+       若只留 R − 8 = 332，则在低难度（gapH = 270）扫到 332 时，
+       区间上沿 = 332 + 270 = 602 顶出屏幕，下面第 4 步的 `Math.min(CFG.H, ...)`
+       会把板底夹回 540，区间宽度从 270 缩到 224，
+       于是被"区间被压窄"那条校验拒绝 —— **生成器 100% 拒发，一组障碍都生不出来**
+       （表现为 camera 一路涨、obstacleCount 恒为 0）。
+       第二项的存在正是为了让"夹取"永远不触发。
+
+     修正后的实际效果（两条约束谁小取谁，**分界点正是难度约 0.57 处**）：
+       k=0   gapH=270 → sHi = min(332, 270) = 270 → 中心最高 405（屏高 75%，缝宽 270 时到达）
+       k=0.5 gapH=170 → sHi = min(332, 370) = 332 → 中心最高 417
+       k=1   gapH=70  → sHi = min(332, 470) = 332 → **中心最高 367（屏高 68%）**
+     也就是说：**难度越高，区间越能贴到屏幕上部** —— 因为缝窄了，同样的"脚位上限 332"
+     就对应更高的中心。贴顶区间（上沿顶到屏幕顶）则不再是特例分支。 */
+  const sLo2 = CFG.PH;
+  const sHi2 = Math.min(PHYS.MAX_PLAYER_TOP - 8, CFG.H - gapH - CFG.PH);
+  if (sHi2 < sLo2) return false;
+
+  /* --- 第 3 步：位置控制器 ——「模式机」+ 由预算反推幅度 ---
+     ============================ 第 15 轮重写 ============================
+     第 11 轮把"死的折返扫掠"换成"小步随机 + 偶尔反向"，统计上是随机的，
+     但**局部永远平滑**：每步只有 12~54 单位、方向 82% 延续 ——
+     连续两组落差 0.1~0.3 个缝高，玩家看不到任何"事件"，
+     所以他仍然说"很规律地上下浮动、没有突变"。
+
+     本轮：位置 = hold / drift / jump 三模式，幅度按**缝高**给、再用预算夹住，
+     突变还会成串（同向 2~4 组）。可行性依然由物理保证，而不是靠调参：
+
+       本组真实时间预算 budget = 间距(px) / 速度(px/s)     ← 密度呼吸会改变它
+       能爬多高 A_up = SAFE_CLIMB × (2×apex/滞空) × budget ← 技能节奏（顶点连点，见下方 ★）
+       能掉多深 A_dn = min(SAFE_FALL² × G·budget²/2, DIVE_MAX) ← 自由落体
+       任何一步的 |Δ| 都被这两个上限夹住 ⇒ 构造上就不可能超预算
+       （`__rand_check.js` 会在外部用同一模型复核，"0 步超预算"是硬判据）
+
+     ★ 为什么上/下用同一个 budget 却给出不同上限：这不是"调参调出来的手感"，
+       而是物理本身的不对称 —— 上升要靠在**顶点连点**（106.5 单位/秒），下降是自由落体。 */
+  const pxFloor = Math.max(CFG.GAP_PX_MIN, lerp(CFG.GAP_PX0, CFG.GAP_PX1, k));
+  const basePx = Math.max(G.speed * gapTime, pxFloor);
+
+  /* --- 第 3a 步：密度「呼吸」——连紧几组、再送一个长间隔 --- */
+  let densF;
+  if ((G.densRun || 0) <= 0) {
+    const r = Math.random();
+    G.densKind = r < 0.30 ? "burst" : (r < 0.75 ? "normal" : "rest");
+    G.densRun = G.densKind === "normal" ? 1 : 2 + Math.floor(Math.random() * 2);   // 2~3 组
+  }
+  G.densRun--;
+  if (G.densKind === "burst") {
+    densF = 1 - (1 - CFG.DENS_BURST) * (0.6 + Math.random() * 0.7);
+  } else if (G.densKind === "rest") {
+    densF = 1 + (CFG.DENS_REST - 1) * (0.6 + Math.random() * 0.7);
+  } else {
+    densF = 1 + (Math.random() * 2 - 1) * CFG.DENS_JIT;
+  }
+  const spacingPx = Math.max(CFG.GAP_PX_MIN, basePx * densF * CFG.DENS_FIX);
+  const budget = spacingPx / G.speed;                    // 本组真实时间预算（秒）
+  /* ★ 爬升速率用**技能节奏**，不是懒节奏（第 17 轮按实测改）。
+     为什么必须改：位置突变的幅度上限直接由它决定 ——
+       · 懒节奏（一个滞空周期点一次）= apex/滞空 ≈ 53.3 单位/秒，而且**净爬升为 0**
+         （点完升一个 apex，又落回同一个高度），它根本不是一个"爬升"策略；
+       · 技能节奏（在**顶点附近**再点一次，重开抛物线）= 每半个滞空吃一个 apex
+         ⇒ 2·apex/滞空 ≈ 106.5 单位/秒；用真 step() + 真早按规则实测 **107.4 单位/秒**。
+       · 为什么合法：点按后 vy = V0，但**下一帧**因重力就变成 V0 − G·dt < V0，早按判据立刻放行；
+         DEBOUNCE 0.08s 远小于半个滞空（0.374s），所以顶点连点永远不会被拦。
+       · 狂点（贴着 0.08s 去抖）实测能到 187 单位/秒 —— 那是上限，**故意不按它建模**，
+         否则"越乱按越强"会变成必须的玩法。取 106.5 = "会用节拍卡顶点"的水平。
+     教训：第 16 轮我按 53.3 收紧夹取（配对修正），结果上跳突变从 53 次掉到 38 次、
+     玩家当场反馈"跳变幅度降低、预测性提高" —— 那不是配对修错了，是**模型选错了人**。 */
+  const CLIMB_RATE = 2 * PHYS.APEX / PHYS.AIR;           // ≈ 106.5 单位/秒（技能节奏，实测 107.4）
+  const A_up = CFG.SAFE_CLIMB * CLIMB_RATE * budget;
+  const A_dn = Math.min(0.5 * CFG.G * (CFG.SAFE_FALL * budget) ** 2, CFG.DIVE_MAX);
+
+  /* --- 第 3b 步：模式机 --- */
+  if (!hasPrev || G.sweepS === undefined) {
+    G.sweepS = clamp(CFG.START_Y, sLo2, sHi2);           // 开局：尽量对准起始高度
+    G.sweepDir = -1; G.moveRun = 0; G.densRun = 0; G.densKind = "normal";
+    G.recoverRun = 0;
+  } else {
+    const span = Math.max(1, sHi2 - sLo2);
+    let mode, dir;
+    if (G.moveRun > 0) {
+      G.moveRun--;                                        // 趋势段：沿用上一组的模式与方向
+      mode = G.moveMode; dir = G.sweepDir;
+    } else {
+      /* 模式概率与密度呼吸**耦合**：间隔长（rest）时才有本钱做突变，
+         连紧（burst）时改成停留/小步 —— 于是"一阵紧"读起来是"要紧盯"，
+         "一口气"读起来是"这里可以来一下大的"，而不是两组独立的随机数。 */
+      const jumpAdj = G.densKind === "rest" ? 0.16 : (G.densKind === "burst" ? -0.14 : 0);
+      const holdAdj = G.densKind === "burst" ? 0.10 : (G.densKind === "rest" ? -0.08 : 0);
+      const pJump = clamp(CFG.MOVE_JUMP_P + jumpAdj, 0.04, 0.80);
+      const pHold = clamp(CFG.MOVE_HOLD_P + holdAdj, 0.04, 0.60);
+      const r = Math.random();
+      mode = r < pHold ? "hold" : (r < pHold + pJump ? "jump" : "drift");
+      /* ★ 方向概率必须**抵消上下幅度不对称**：本作能俯冲 ~200 却只能爬 ~55，
+         若方向按 50/50 掷，随机游走会一路往下沉 —— 实测区间中心落点会退化成
+         "下 1/3 = 55% / 上 1/3 = 5%"，正是第 10 轮玩家抱怨过的那个病。
+         所以基准概率取 pUp = A_dn / (A_up + A_dn)（抵消幅度差），再叠加贴边回中。 */
+      const pUpBase = clamp(A_dn / (A_up + A_dn + 1e-6), 0.25, 0.85);
+      const pos = (G.sweepS - sLo2) / span;
+      const upBias = pos < 0.28 ? Math.min(0.94, pUpBase + 0.28)
+        : (pos > 0.72 ? Math.max(0.08, pUpBase - 0.28) : pUpBase);
+      dir = Math.random() < upBias ? 1 : -1;
+      /* 拉起段：刚做过一次大俯冲，接下来 1~2 组强制向上 —— 
+         于是"俯冲 → 一节节拉起"成为可读的段落（玩家要的"突变下坠和上升"） */
+      if (G.recoverRun > 0) { G.recoverRun--; dir = 1; if (mode === "hold") mode = "drift"; }
+      /* ★ 上升突变只在"有余量"的组里做：连紧（burst）时预算最紧，而爬升是最贵的动作，
+         在那里硬冲只会变成"来不及跟"。把 burst 里的上跳降级为小步爬 —— 
+         于是"紧的那几组"永远只是"要保持住"，"松的那几组"才有大动作。 */
+      if (mode === "jump" && dir > 0 && G.densKind === "burst") mode = "drift";
+      G.sweepDir = dir; G.moveMode = mode;
+      /* 突变成串：让玩家真的经历"一路俯冲 / 连续爬升" */
+      if (mode === "jump" && Math.random() < CFG.TREND_P) {
+        G.moveRun = 1 + Math.floor(Math.random() * CFG.TREND_RUN);
+      }
+    }
+    let mag;
+    if (mode === "hold") {
+      mag = Math.random() * 6;                            // 原地停留（±6 的呼吸）
+    } else if (mode === "jump") {
+      mag = dir > 0
+        ? Math.min(A_up, gapH * lerp(CFG.JUMP_UP_LO, CFG.JUMP_UP_HI, Math.random()))
+        : Math.min(A_dn, gapH * lerp(CFG.JUMP_DN_LO, CFG.JUMP_DN_HI, Math.random()));
+    } else {
+      mag = A_up * lerp(CFG.DRIFT_LO, CFG.DRIFT_HI, Math.random());
+    }
+    G.sweepS += dir * mag;
+    /* 碰界折返：并**取消趋势段** —— 否则剩余几步会贴在边界上空转（白费一次突变） */
+    if (G.sweepS >= sHi2) { G.sweepS = sHi2; G.sweepDir = -1; G.moveRun = 0; }
+    if (G.sweepS <= sLo2) { G.sweepS = sLo2; G.sweepDir = 1; G.moveRun = 0; }
+    /* 记下"刚发生了一次大俯冲" → 触发拉起段 */
+    if (dir < 0 && mag >= gapH * 1.2) G.recoverRun = 1 + Math.floor(Math.random() * 2);
+  }
+  /* 落点抖动（用起上面那个原本空转的 jit），并**用物理上限硬夹一次**：
+     抖动加在夹取之后会让实际位移超出 A_up/A_dn（每侧 ±10 ⇒ 最坏多 20 单位 ≈ 0.38s），
+     所以最后必须按"相对上一组"再夹一次 —— 这样"任何一步都不超自己的预算"
+     就成了一条**构造性保证**，而不是概率性的。 */
+  let sNow = clamp(G.sweepS + jit, sLo2, sHi2);
+  if (hasPrev) {
+    const sPrevRaw = prev.pillarTop + CFG.PH;
+    /* ★★ 第 16 轮审查修正：夹取必须按**上一组**的间距算可用时间。
+       本组的 spacingPx 管的是"从本组走到下一组"（见第 3 步后的 gapPos），
+       拿它来夹"走进本组"的位移就是**配对错误**：密度呼吸让相邻间距最多差 2.11 倍
+       （burst 0.71 / rest 1.55），于是"紧一组之后紧跟一个大上跳"会拿到两倍于
+       实际可用的时间。实测（按玩家真正拥有的时间复核）：599 步里 29 步超时，
+       最坏需要 1.389s 却只有 0.90s —— 原来的"构造上不可能超预算"只在间距恒定时成立。
+       取两者的较小值最省心：既保留原有夹取，又保证不超出真实可用时间。 */
+    const prevSpacing = prev.spacingPx || spacingPx;
+    const budgetMove = Math.min(budget, prevSpacing / G.speed);
+    const A_upMove = CFG.SAFE_CLIMB * CLIMB_RATE * budgetMove;
+    const A_dnMove = Math.min(0.5 * CFG.G * (CFG.SAFE_FALL * budgetMove) ** 2, CFG.DIVE_MAX);
+    if (sNow - sPrevRaw > A_upMove) sNow = sPrevRaw + A_upMove;
+    else if (sPrevRaw - sNow > A_dnMove) sNow = sPrevRaw - A_dnMove;
+    sNow = clamp(sNow, sLo2, sHi2);
+  }
+  const c = sNow + half;
+  const winLo2 = sNow;
+
+  /* --- 第 4 步：由区间反推障碍 ---
+     区间 = [s, s+gapH]（玩家 py 的可行范围）
+       下界障碍：柱顶 = s − PH        （玩家脚必须高于柱顶）
+       上界障碍：板底 = s + gapH + PH （玩家头必须低于板底）
+     再各自夹到"真的挡得住 / 跳得过去"的范围内。 */
+  let pillarTop = Math.max(0, sNow - CFG.PH);
+  let plateBottom = Math.min(CFG.H, sNow + gapH + CFG.PH);
+  /* 不夹取板底：扫掠范围 s ≤ R − gap − PH 已保证板底 ≤ 可达上限。
+     旧的 PHYS.PAIR_PB_HI 夹取是上一版架构的遗留，会把区间上沿削掉 1~4 像素，
+     导致下面那条判定失败 —— 实测造成 100% 跳过。 */
+  const winHi2 = plateBottom - CFG.PH;
+  /* 夹取后区间若被压窄到放不下角色，则本回合放弃 */
+  if (winHi2 - winLo2 < gapH - 1) return false;
+
+  /* --- 第 5 步：某一侧落到屏幕外时，该侧障碍自动消失 ---
+     "只有上"或"只有下"是区间位置的**自然结果**，不需要单独判断形态。 */
+  const hasPillar = pillarTop > 1;
+  const hasPlate = plateBottom < CFG.H - 1;
+  const mode = hasPillar ? (hasPlate ? "pair" : "pillar") : "ceil";
+  /* ===== 迁移检查已删除 =====
+     旧实现在这里逐组校验"玩家能否从上一组迁移到本组"，但它反复误报：
+     实测出现 "上升不可达 A0=58 B0=99"，而 climbTime(58,99) 手算只要 0.28 秒
+     （预算 1.25 秒），判断本身有 bug；且它把跳过率推到 63%。
+     架构上它已经是**冗余的**：位置由扫掠控制器产生，每步 ≤ STEP_MAX = 70，
+     而求解器独立算出单步上限 ≈ 72 —— 构造上就不可能违反迁移约束。
+     因此直接删除，改由验证脚本在外部检查（见 __verify.js）。 */
+
+  const obs = {
+    kind: mode,
+    w: Math.round(lerp(CFG.OW_MIN, CFG.OW_MAX, Math.random())),
+    pillarTop: pillarTop,          // 单柱与成对时有效
+    plateBottom: plateBottom,      // 单板与成对时有效
+    x: G.camera + CFG.W + CFG.SPAWN_MARGIN,
+    spawnCam: G.camera,
+    /* 诊断字段（验证脚本与遥测要用，不影响玩法）：
+       moveMode/Δ 记录位置是怎么来的，A_up/A_dn 是"本组预算下物理允许的位移上限"，
+       spacingPx 是含密度呼吸的真实间距 —— `__rand_check.js` 靠这三项**直接**复核
+       "没有任何一步超出自己的预算"，而不必反推参数。 */
+    moveMode: hasPrev ? (G.moveMode || "drift") : "init",
+    moveDelta: hasPrev ? Math.round(sNow - (prev.pillarTop + CFG.PH)) : 0,
+    A_up: +A_up.toFixed(1), A_dn: +A_dn.toFixed(1),
+    spacingPx: Math.round(spacingPx),
+    densKind: G.densKind,
+    // 运动段：本阶段全部静止，横向速度系数恒为 1
+    vxFactor: 1, traj: "static", period: 0, amp: 0,
+    canConstrain: true
+  };
+  if (mode === "pillar") obs.plateBottom = CFG.H;      // 无板
+  if (mode === "ceil") obs.pillarTop = 0;              // 无柱
+
+  G.obstacles.push(obs);
+  G.lastObstacle = obs;
+  G.obstacleCount = (G.obstacleCount || 0) + 1;
+
+  /* 下一个生成点的水平位置：**密度是难度的主轴之一**，但这个间距现在有"呼吸"：
+     基础值仍是 max(速度 × 时间间距, 像素下限(k))（见 CFG 那段说明），
+     再乘上本轮抽到的 densF（burst 0.71~0.87 / normal ±10% / rest 1.25~1.55）——
+     间距**均值不变**，但玩起来是"一阵紧、一口气"，而不是均匀排队。
+     ★ 关键：位置突变的幅度上限（A_up / A_dn）就是在这一步之后用 spacingPx 反推的
+       （见第 3 步），所以"紧的那几组"自动只配小位移 —— 不会出现"又紧又要大跳"的死局。
+     climbTime 高于可达顶点时返回 Infinity，必须过滤，否则 nextSpawnDist 变 Infinity、
+     生成器彻底停摆（实测踩过这个坑）。 */
+  const gapPos = obs.x + obs.w / 2 + spacingPx + CFG.PW / 2;
+  obs.spacingPx = spacingPx;          // 记在本组上：验证脚本要用它算真实预算
+  let leadPos = gapPos;
+  if (pillarTop > 0) {
+    const needY = pillarTop + CFG.PH;
+    /* ★ 第 16 轮审查结论：这条分支**目前恒不生效**（实测 leadPos 从未赢过 Math.max，
+       240 秒长局里 gapPos − leadPos 最小仍有 1207px），保留它只是为了不动生成器这段
+       高风险代码。但两处注释必须诚实，免得下一个人以为它是活的：
+         ① climbTime 是第 6 轮之前"从地面起跳"模型的公式，判别式按**绝对高度**算
+            （V0² − 2G·h0）。现在 h0 = START_Y = 300 ⇒ 判别式恒为负 ⇒ 恒返回 Infinity。
+            旧兜底把它当 0 用，是**最不保守**的一侧 —— 方向错的；现在兜底留 0.4 秒
+            （按"慢爬升"53.3 单位/秒估算，够爬满一个 apex）。
+         ② 只要日后把组间距压到"一屏以内"，这条分支就会真的生效，届时它必须是对的值。 */
+    let climb = 0;
+    if (needY > CFG.START_Y) {
+      climb = 0.4;
+      const t = climbTime(CFG.START_Y, needY);
+      if (Number.isFinite(t)) climb = t;      // 哪天公式修对了，仍以真实值为准
+    }
+    const leadDist = Math.max(CFG.LEAD_MIN, G.speed * (climb + CFG.LEAD_TIME));
+    leadPos = G.camera + CFG.PLAYER_X + leadDist + obs.w / 2 + CFG.PW;
+  }
+  G.nextSpawnDist = Math.max(gapPos, leadPos);
+  G.gaps.push(spacingPx / G.speed);   // 记录**真实**相遇间隔（含呼吸），而不是名义 gapTime
+  return true;
+}
+
+/* ------------------------------ 状态重置 ------------------------------ */
+function resetRun() {
+  G.camera = 0; G.speed = CFG.SPD0; G.elapsed = 0;
+  G.py = PHYS.HOVER; G.vy = 0;
+  G.score = 0;                    // 必须重置：难度与速度都按距离取值，残留值会串局
+  G.obstacles.length = 0;
+  G.lastObstacle = null; G.constrainedEdge = 0; G.corPhase = 0;
+  G.obstacleCount = 0; G.sweepStep = 0;
+  G.sweepS = undefined; G.sweepDir = -1;   // 显式清掉：开局那组要重新对准起始高度
+  G.moveRun = 0; G.moveMode = "drift";     // 位置模式机的趋势段
+  G.recoverRun = 0;                        // 大俯冲之后的"拉起段"
+  G.densRun = 0; G.densKind = "normal";    // 密度呼吸的段长
+  G.reason = "";
+  G.lastInputAt = -1; G.invalidFlash = 0;
+  G.gaps.length = 0;
+  G.nextSpawnDist = CFG.W + CFG.SPAWN_MARGIN + CFG.FIRST_DELAY;
+}
+
+function toReady() { resetRun(); G.state = ST.READY; }
+
+/* ------------------------------ 输入处理 ------------------------------ */
+/** 统一动作入口：键盘空格 / 鼠标左键 / 触屏点击 —— 三条路都汇到这里。
+ *  为什么必须只有一个入口：三套事件各写一遍判定，早按/去抖/重开锁就会出现
+ *  三份略有差异的实现，手感会随输入设备漂移（历史上就是这样漏掉触屏的）。 */
+function intentJump(now) {
+  if (G.state === ST.READY) {
+    /* 开局：直接站在 START_Y（远高于死亡线）并给一次向上初速。
+       旧实现是从 y=0 起跳，玩家必须在第一次落地（0.65s）前就掌握节奏，
+       遥测里 6/9 局死于触底、其中一局 0 次点按 —— 正是这个原因。 */
+    G.state = ST.PLAYING;
+    G.py = CFG.START_Y;
+    G.vy = CFG.START_V;
+    G.lastInputAt = now;
+    Telemetry.startRun();                                   // 遥测：开局
+    return;
+  }
+  if (G.state === ST.PAUSED) { G.state = ST.PLAYING; return; }
+  if (G.state === ST.OVER) {
+    if (now >= G.lockUntil) { toReady(); intentJump(now); }  // RESTART_LOCK 之后才响应
+    return;
+  }
+  // PLAYING
+  if (now - G.lastInputAt < CFG.DEBOUNCE) return;         // 去抖：过滤意外双击
+  if (G.vy >= CFG.V0) {                                   // 早按：丢高度，仅给视觉标记
+    G.invalidFlash = 0.12;
+    Sfx.invalid();                                        // 低沉短音（必须与跳跃音明显区分）
+    /* 失效粒子：从机身向四周炸出一小圈，颜色偏蓝 ——
+       这是"按键没生效"最重要的可读性反馈，属于必需项而不是打磨项：
+       玩家会以为输入丢了，不给反馈就会一直重复无效点按。 */
+    const cx = PX0 + CFG.PW / 2, cy = CFG.H - (G.py + CFG.PH / 2);
+    for (let i = 0; i < 7; i++) {
+      const a = (i / 7) * Math.PI * 2;
+      spawnParticle(cx, cy, Math.cos(a) * 70, -Math.sin(a) * 70, 0.30, [120, 200, 255], 2);
+    }
+    Telemetry.onTap(false);                               // 遥测：记为一次无效早按
+    return;
+  }
+  G.vy = CFG.V0;                                          // 速度重设 = 重开一条抛物线
+  G.lastInputAt = now;
+  Sfx.jump();                                             // 上扬短音
+  /* 推进器喷流：机身下方喷出，颜色偏橙 ——
+     与"失效粒子"在颜色和方向上都要区分开，否则玩家读不出这次点按到底有没有生效。 */
+  const tx = PX0 + CFG.PW / 2, ty = CFG.H - G.py;
+  for (let i = 0; i < 6; i++) {
+    spawnParticle(tx - 2 + Math.random() * 4, ty + Math.random() * 3,
+      -30 + Math.random() * 20, -60 - Math.random() * 70, 0.26, [255, 150, 70], 2);
+  }
+  Telemetry.onTap(true);                                  // 遥测：记为一次有效点按
+}
+
+const nowSec = () => performance.now() / 1000;
+
+window.addEventListener("keydown", e => {
+  if (e.code === "KeyH") { toggleTelemetry(); return; }     // 调试：打开遥测面板
+  if (e.code === "KeyC") { G.showHitbox = !G.showHitbox; return; }   // 调试：碰撞盒轮廓
+  if (e.code === "KeyM") {                                  // 静音开关
+    Sfx.muted = !Sfx.muted;
+    if (!Sfx.muted) Sfx.init();                             // 首次交互后才初始化音频上下文
+    return;
+  }
+  if (e.code === "Space" || e.key === " " || e.key === "Spacebar") {
+    e.preventDefault();                                   // 阻止页面滚动
+    if (!e.repeat) intentJump(nowSec());                  // 长按无效
+  }
+}, { passive: false });
+
+cv.addEventListener("mousedown", e => { if (e.button === 0) intentJump(nowSec()); });
+cv.addEventListener("touchstart", e => { e.preventDefault(); intentJump(nowSec()); }, { passive: false });
+overlayEl.addEventListener("mousedown", () => intentJump(nowSec()));
+
+window.addEventListener("blur", () => { if (G.state === ST.PLAYING) G.state = ST.PAUSED; });
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && G.state === ST.PLAYING) G.state = ST.PAUSED;
+});
+
+/* ------------------------------ 碰撞与物理 ------------------------------ */
+const overlaps = (a0, a1, b0, b1) => a0 < b1 && a1 > b0;
+const PX0 = CFG.PLAYER_X, PX1 = CFG.PLAYER_X + CFG.PW;
+
+/** 扫掠式碰撞：同时检查障碍物"上一帧位置"与"当前位置"，
+    覆盖两者之间的整段扫过区域以防高速穿透。
+    注：旧实现是把障碍物横向判定范围外扩一个速度步长（约 4px），
+    这会让障碍物左右各多出隐形判定，造成"视觉没碰到却被判死"——已改掉。
+    闸门有上下两个碰撞体：地面柱 0→pillarTop、悬顶块 plateBottom→屏幕顶。 */
+function hitsObstacle(pyPrev, pyNow) {
+  const sweep = G.speed * CFG.DT;
+  for (const o of G.obstacles) {
+    const cx = o.x - G.camera;
+    const ox1 = cx + o.w / 2, ox0 = cx - o.w / 2;
+    // 横向：两帧位置任一重叠即算进入
+    const xHit = overlaps(PX0, PX1, ox0 - sweep, ox1) || overlaps(PX0, PX1, ox0, ox1 - sweep);
+    if (!xHit) continue;
+    // 纵向：撞到地面柱顶 or 撞到悬顶块底
+    if (overlaps(pyPrev, pyNow, 0, o.pillarTop)) return o;
+    if (overlaps(pyPrev, pyNow, o.plateBottom, CFG.H)) return o;
+  }
+  return null;
+}
+
+function fail(reason) {
+  if (G.state !== ST.PLAYING) return;
+  G.reason = reason;
+  G.state = ST.OVER;
+  G.lockUntil = nowSec() + CFG.RESTART_LOCK;
+  G.lastScore = G.score;
+  if (G.score > G.best) { G.best = G.score; Store.write(G.best); }
+  const run = Telemetry.finishRun();                        // 遥测：结算本局
+  // 结算页显示一句最有价值的诊断（优先展示 bad 级结论）
+  const diags = (run && run.diagnosis) || [];
+  const top = diags.find(d => d.level === "bad") || diags.find(d => d.level === "warn") || null;
+  lastRunInfo = top ? "诊断：" + top.text : null;
+  // 撞击表现：音效 + 一圈碎片
+  Sfx.hit();
+  const cx = PX0 + CFG.PW / 2, cy = CFG.H - (G.py + CFG.PH / 2);
+  for (let i = 0; i < 22; i++) {
+    const a = Math.random() * Math.PI * 2, sp2 = 60 + Math.random() * 180;
+    spawnParticle(cx, cy, Math.cos(a) * sp2, -Math.sin(a) * sp2,
+      0.45 + Math.random() * 0.35,
+      i % 3 === 0 ? [255, 200, 88] : (i % 3 === 1 ? [255, 120, 60] : [150, 210, 250]), 2);
+  }
+}
+
+function step(dt) {
+  if (G.state !== ST.PLAYING) return;
+
+  G.elapsed += dt;
+  /* 难度与速度现在都按**距离**取值，所以先由 camera 算出距离。
+     注意这里**必须**用 G.camera 现算，不能读 G.score ——
+     上一版写成 G.speed = currentSpeed(G.score)，而 G.score 在这一行还是 undefined，
+     undefined/300 = NaN → speed = NaN → camera += NaN → camera 永远追不上生成点，
+     **障碍一个都不会生成**（五件套里的 __shot/__obstacle_check 当场报 obstacleCount=0）。
+     教训：凡是"派生量吃前一帧状态"的地方，要么自己算，要么保证它已被初始化。 */
+  G.score = G.camera / CFG.PX_PER_M;
+  G.speed = currentSpeed(G.score);
+
+  const pyPrev = G.py;
+  G.vy -= CFG.G * dt;
+  G.py += G.vy * dt;
+  Telemetry.sample(dt);                                    // 遥测：高度采样 + 顶部滞留统计
+
+  // 失败判定优先级：顶部 → 障碍物 → 底部（方案 5.6）
+  if (G.py + CFG.PH >= CFG.H) { fail(CFG.REASONS.ceiling); return; }
+  if (hitsObstacle(pyPrev, G.py)) { fail(CFG.REASONS.obstacle); return; }
+  if (G.py <= 0) { fail(CFG.REASONS.floor); return; }
+
+  G.camera += G.speed * dt;
+
+  // 回收出屏障碍物 + 遥测：记录"通过"与"与障碍的最小间隙"
+  for (let i = G.obstacles.length - 1; i >= 0; i--) {
+    const o = G.obstacles[i];
+    if (o.x + o.w / 2 - G.camera < -200) {
+      if (!o.passed) { o.passed = true; Telemetry.onPass(o); }
+      G.obstacles.splice(i, 1);
+    }
+  }
+  for (const o of G.obstacles) {                            // 中心越过角色位置即视为通过
+    if (!o.passed && o.x - G.camera < CFG.PLAYER_X + CFG.PW / 2) {
+      o.passed = true;
+      Telemetry.onPass(o);
+    }
+  }
+
+  // 生成（自检不通过则延后重试）
+  if (G.camera + CFG.W + CFG.PW / 2 >= G.nextSpawnDist) {
+    if (!generateObstacle()) G.nextSpawnDist = G.camera + CFG.W + CFG.SPAWN_MARGIN + 200;
+  }
+
+  G.score = G.camera / CFG.PX_PER_M;   // 与 step() 里同步，供 renderUI / 难度条读取
+  if (G.invalidFlash > 0) G.invalidFlash -= dt;
+}
+
+/* ------------------------------ 渲染（像素风 · 程序化） ------------------------------
+   绘制顺序（从远到近）：
+     星云底 → 三层星场 → 障碍（星云岩体）→ 死亡线（能量边界）→ 粒子 → 飞船 → HUD
+   全部程序化绘制，不使用任何外部图片文件。 */
+
+/** 缓慢移动的星云团（视差比 0.06~0.16，几乎不动，只提供色调层次）
+ *
+ *  设计要点（都是本轮 bug 的教训）：
+ *  · 不再用"一个大实心矩形" —— 改由 drawSoftPatch 羽化，边界不可见（见其注释）
+ *  · 尺寸拉开档次（110~250 宽），避免几块一样大、排成一排像"三个按钮"
+ *  · 色值不要都挑最亮的那个：第三块原来是 #070f22，与底色差 6 个色阶，
+ *    是三个里最扎眼的，已调暗
+ *  · 纵向分布到上/中/下三段，而不是都挤在屏幕中部一条带上 */
+const NEBULA = [  { x:   90, y:  40, w: 190, h: 125, par: 0.06, col: "#080d24" },
+  { x:  620, y: 300, w: 250, h: 150, par: 0.10, col: "#0a0a22" },
+  { x:  380, y: 150, w: 110, h:  75, par: 0.16, col: "#08101f" },
+  { x:  820, y:  70, w: 150, h: 100, par: 0.08, col: "#090c26" },
+  { x:  230, y: 400, w: 170, h: 110, par: 0.12, col: "#0d1436" },
+];
+
+/** 深空底色：垂直渐变 + 星云团 */
+/* 渐变的 stop 单独列出来，因为 drawSoftPatch() 需要**采样底色**来做混色
+   （见下方的说明），不能只把渐变交给 canvas 就完事。 */
+const SKY_STOPS = [
+  [0.00, "#0a1030"],     // 顶部：偏蓝紫
+  [0.45, "#05081a"],     // 中部：最暗
+  [1.00, "#0b0f26"],     // 底部：略提亮，避免死黑
+];
+
+/** 按 t（0..1）在 SKY_STOPS 上取色 —— drawSoftPatch 要用它采样底色 */
+const SKY_RGB = SKY_STOPS.map(s => hexToRgb(s[1]));
+function skyColorAt(t) {
+  const tc = clamp(t, 0, 1);
+  for (let i = 0; i < SKY_STOPS.length - 1; i++) {
+    const t0 = SKY_STOPS[i][0], t1 = SKY_STOPS[i + 1][0];
+    if (tc >= t0 && tc <= t1) {
+      const k = (tc - t0) / Math.max(1e-6, t1 - t0);
+      const a = SKY_RGB[i], b = SKY_RGB[i + 1];
+      return [Math.round(a[0] + (b[0] - a[0]) * k),
+              Math.round(a[1] + (b[1] - a[1]) * k),
+              Math.round(a[2] + (b[2] - a[2]) * k)];
+    }
+  }
+  return SKY_RGB[SKY_RGB.length - 1].slice();
+}
+
+/** 星云中心的混色比例。数值由 __nebula_check.js 搜索得出：
+    太小 → 星云等于没画；太大 → 与底色对比过强、看着像实体障碍。
+    现在不需要再靠"层数"来控制边界了（径向渐变本身没有边），
+    层数/色阶那套判据请一并作废。 */
+const NEBULA_ALPHA_MAX = 0.85;
+
+/** 羽化星云团：**径向渐变**，颜色沿半径连续变化，到边缘 alpha 正好为 0。
+ *
+ *  为什么不是"叠 N 层内缩矩形"（我走过的弯路，别再回去）：
+ *  那种做法每一层都是一个**矩形**，n 层就有 n 条**笔直的横边和竖边**。
+ *  即使相邻层只差 1 个色阶、总色差也只有 5 个色阶，人眼对"平滑渐变里
+ *  突然出现一条直线"依然极其敏感 —— 画面上就是几个方块，
+ *  和玩家截图里看到的一模一样。**本质是"边是直的"，不是"色差太大"。**
+ *  径向渐变没有边：填充区域只是个包围盒，可见形状完全由渐变决定。
+ *
+ *  椭圆靠 ctx.scale：先平移到中心、横向拉伸 rx/ry，再画半径 ry 的正圆。 */
+
+function drawSoftPatch(cx, cy, w, h, col, alphaMax) {
+  const rx = w / 2, ry = h / 2;
+  if (rx < 1 || ry < 1) return;
+  const tint = hexToRgb(col);
+  const bg = skyColorAt(cy / CFG.H);
+  /* 中心的实际颜色（手算混色，与底色无关的部分交给渐变） */
+  const inner = "rgb(" +
+    Math.round(bg[0] + (tint[0] - bg[0]) * alphaMax) + "," +
+    Math.round(bg[1] + (tint[1] - bg[1]) * alphaMax) + "," +
+    Math.round(bg[2] + (tint[2] - bg[2]) * alphaMax) + ")";
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.scale(rx / ry, 1);                    // 把正圆拉成椭圆
+  const g = ctx.createRadialGradient(0, 0, 0, 0, 0, ry);
+  g.addColorStop(0.00, inner);
+  g.addColorStop(0.45, inner);              // 中心一小片保持均匀，避免正中央出现针尖
+  g.addColorStop(1.00, "rgba(" + bg[0] + "," + bg[1] + "," + bg[2] + ",0)");
+  ctx.fillStyle = g;
+  ctx.fillRect(-rx, -ry, rx * 2, ry * 2);
+  ctx.restore();
+}
+
+/* ------------------------------ 星空（底色 + 星云团 + 天体 + 星场） ------------------------------ */
+/** 深空底色：垂直渐变 + 星云团 */
+function drawNebulaBase() {
+  const W = CFG.W, H = CFG.H;
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  for (const [t, c] of SKY_STOPS) g.addColorStop(t, c);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  for (const cl of NEBULA) {
+    const span = W + cl.w;
+    const x = ((cl.x - G.camera * cl.par) % span + span) % span - cl.w;
+    drawSoftPatch(x + cl.w / 2, cl.y + cl.h / 2, cl.w, cl.h, cl.col, NEBULA_ALPHA_MAX);
+  }
+}
+
+/** 和 drawSoftPatch 同款，但中心混色比例可以单独指定 —— 供气态行星的云带用。
+ *  **刻意不用 skyColorAt**：天体这一整段在脚本最末尾，要完全自包含，
+ *  才不会被"抽取代码段"的验证脚本牵连出重复声明。底色算法与 skyColorAt 同源。 */
+function drawSoftPatchRaw(cx, cy, w, h, col, alphaMax) {
+  const rx = w / 2, ry = h / 2;
+  if (rx < 1 || ry < 1) return;
+  const tint = hexToRgb(col);
+  /* 底色自算，**不用 skyColorAt** —— 这一段要完全自包含（放在 render 之前、
+     不属于任何抽取段），依赖越少越搬得动。算法与 skyColorAt 同源：在 SKY_STOPS 上插值。 */
+  const skyT = clamp(cy / CFG.H, 0, 1);
+  let bg = SKY_RGB[0];
+  for (let i = 0; i < SKY_STOPS.length - 1; i++) {
+    const t0 = SKY_STOPS[i][0], t1 = SKY_STOPS[i + 1][0];
+    if (skyT >= t0 && skyT <= t1) {
+      const kk = (skyT - t0) / Math.max(1e-6, t1 - t0);
+      const a0 = SKY_RGB[i], b0 = SKY_RGB[i + 1];
+      bg = [Math.round(a0[0] + (b0[0] - a0[0]) * kk),
+            Math.round(a0[1] + (b0[1] - a0[1]) * kk),
+            Math.round(a0[2] + (b0[2] - a0[2]) * kk)];
+      break;
+    }
+  }
+  const inner = "rgb(" +
+    Math.round(bg[0] + (tint[0] - bg[0]) * alphaMax) + "," +
+    Math.round(bg[1] + (tint[1] - bg[1]) * alphaMax) + "," +
+    Math.round(bg[2] + (tint[2] - bg[2]) * alphaMax) + ")";
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.scale(rx / ry, 1);
+  const g = ctx.createRadialGradient(0, 0, 0, 0, 0, ry);
+  g.addColorStop(0.00, inner);
+  g.addColorStop(0.40, inner);
+  g.addColorStop(1.00, "rgba(" + bg[0] + "," + bg[1] + "," + bg[2] + ",0)");
+  ctx.fillStyle = g;
+  ctx.fillRect(-rx, -ry, rx * 2, ry * 2);
+  ctx.restore();
+}
+
+
+/* ------------------------------ 宇宙天体（行星 / 星环 / 黑洞 / 恒星 / 流星） ------------------------------
+   第 13 轮反馈："我希望背景的相关元素（行星，黑洞等）也是像素风。"
+
+   ★ 一条必须先讲清的边界（别把这条和 §5.9 搞混）：
+     "柔和元素必须用径向渐变" 管的是**边界本该看不见**的东西（星云团、恒星光晕），
+     那些地方用矩形就会露出直边、被玩家看到方块。
+     而**星球本体本来就是硬边实体** —— 就像飞船是硬边像素块一样。
+     所以这里用像素点阵画星球，不违反任何纪律；恒星光晕仍然走 drawSoftPatchRaw。
+
+   实现方式：**算法生成像素球**，而不是手写点阵字符图。
+   ASCII 精灵适合"轮廓有讲究"的造型（比如飞船的机头/鳍/座舱），
+   而球体只由半径与光照方向决定 —— 用算法生成，改 r / col / light 就能长出一颗新星球，
+   不必维护 6 份点阵艺术（这也让"大小不同、颜色不同"这个需求几乎零成本）。
+
+   立体感 = 4 级明暗 + **有序抖动**（棋盘 mix）。抖动是像素画的标准手法：
+   用两种颜色交错排布模拟中间色，既得到过渡又不引入糊掉的渐变色。
+
+   三条自制规则仍适用：
+     ① 星球本体用逻辑像素块（BODY_PX 一格），**不许退回径向渐变**；
+     ② 尺寸克制：格子数 3~7，实测代价见 §5.14；
+     ③ 不许抢戏：只用暗哑蓝紫/暗金，屏幕中段上方留空。 */
+const BODY_PX = 2;          // 天体的一格 = 2 逻辑像素（飞船是 3，天体略细以拉开层次）
+
+/** 天体清单。**r 的单位从"逻辑像素"改成了"格"**（第 13 轮像素化时改的）：
+ *  以前 r=17~46 是像素半径，现在 r=3~7 是格子半径，实际像素半径 = r × BODY_PX。
+ *  这样"大小不同"只靠一个整数控制，而且格子数一定，抖动相位的疏密也就稳定。
+ *  squash = 环/吸积盘的竖直压扁系数；band = 气态行星云带的相对高度。 */
+const BODIES = [
+  /* —— 远景：很小很暗，只提供"这片空间里有东西"的感觉 —— */
+  { type: "rocky",    x:  140, y:  78, r: 4, par: 0.030, col: "#4a6088", light: [-0.42, -0.36] },
+  { type: "gas",      x:  880, y: 392, r: 5, par: 0.055, col: "#6a5f8c", light: [-0.36, -0.40], band: 0.30 },
+  { type: "ringed",   x: 1480, y: 128, r: 5, par: 0.078, col: "#7a7aa8", light: [-0.38, -0.30], squash: 0.34 },
+  /* —— 中景 —— */
+  { type: "rocky",    x: 2150, y: 452, r: 6, par: 0.105, col: "#4a8072", light: [-0.46, -0.34] },
+  { type: "gas",      x: 2760, y: 288, r: 5, par: 0.145, col: "#8a7658", light: [-0.32, -0.42], band: 0.26 },
+  /* —— 特殊天体 —— */
+  /* 黑洞：黑物体在深空里**没有轮廓就等于看不见**，所以它额外多一层"暗晕"
+     （drawPixelHole 会用 skyColorAt 算比底色更暗的一圈），这样视觉上是个"洞"而不是失踪。 */
+  { type: "blackhole", x: 3400, y: 158, r: 7, par: 0.185, squash: 0.50, col: "#c98a5a" },
+  { type: "ringed",   x: 4120, y: 420, r: 7, par: 0.300, col: "#8a7aa0", light: [-0.34, -0.36], squash: 0.42 },
+  /* 恒星：核心是像素球，"光晕"走柔和渐变（光本来就该是柔的） */
+  { type: "sun",      x: 4880, y:  92, r: 8, par: 0.040, col: "#e8a860", halo: 118 },
+];
+
+/** 流星：**不定时从屏幕内不同位置划过**的像素亮痕。
+ *
+ * ★ 第 14 轮重做。玩家原话："流星不太像流星，可以调整为不定时从屏幕内不同位置划过，
+ *   而不是只在背景一直闪烁。"
+ *   **根因：位置与淡入淡出是解耦的。** 旧版是 3 条固定 (x0, y0) + triWave(fade)：
+ *   纵向位置**永远不变**、横向只跟着视差慢慢挪，于是它只能"在同一处原地忽明忽暗" ——
+ *   会闪、但没有位移，就不构成"划过"。玩家看到的正是"背景一直在闪"。
+ *
+ * 现在：位置由 (t − t0) × 速度真实推进，斜向下 11.5°~35.5°，速度 640~1000 px/s
+ *   （横穿屏幕约 1~1.5s），拖尾 = 速度 × 0.20 ⇒ 130~200px 的长痕。
+ *
+ * ★ 时间线是**无状态**的：第 k 个时间槽用 hash(k) 决定"这一槽有没有流星、几时出发、
+ *   往哪飞"，不为流星维护活动列表。原因有二：
+ *   ① `step()` 被多个验证脚本单独抽取（AGENTS §5.14），往里塞"维护流星数组"会牵动
+ *      所有抽取边界；hash 方案不碰 step()。
+ *   ② hash 天然"不定时"：每槽独立抽签，还会出现连着两颗。
+ *
+ * ★ 颜色**只用固定色阶**（METEOR_TINT 的常量），不做 RGB 缩放 —— 缩放会产出任意颜色，
+ *   有撞上 HUD / 飞船 / 危险边判据色的风险（AGENTS #20，这个坑踩过一次：偶发假故障）。
+ *   淡出也不是"调亮度"，而是**沿色阶往下掉档**（烧尽感），于是画出来的颜色永远可枚举。 */
+const METEOR_CFG = {
+  SLOT: 3.2, CHANCE: 0.62,   // 时间槽 + 每槽出现概率 ⇒ 平均约 5.2s 一颗，且不定时
+  LIFE0: 0.85, LIFE1: 1.55,  // 存活时长（秒）
+  SPD0: 640, SPD1: 1000,     // 速度（px/s）：横穿屏幕约 1~1.5s
+  TRAIL: 0.20,               // 拖尾长度 = 速度 × 该系数
+  STEP: 4, CELL: 5,          // 阶梯步长 / 格宽。**CELL 必须 > STEP**，否则尾巴断成虚线（§5.14 坑三）
+  Y0: 112, Y1: 388,          // 起点纵向范围：不进 HUD 带（顶部 100 行，见 __shot.js）
+  ANG0: 0.20, ANG1: 0.62,    // 与水平夹角（弧度）≈ 11.5°~35.5°
+};
+
+/** 三套固定色阶（冷白 / 暖金 / 淡青），每套 8 级：0 = 最亮（头部），7 = 最暗（尾梢）。
+ *  刻意**不含粉色** —— 高饱和粉是障碍危险边与死亡线的专属，天体不许抢戏（§0.8.3）。 */
+const METEOR_TINT = [
+  [[236,246,255],[212,230,252],[178,200,238],[142,166,206],[110,132,172],[82,100,136],[58,72,102],[40,50,72]],
+  [[255,242,216],[252,226,188],[240,202,158],[214,174,132],[176,142,108],[138,110,84],[102,80,62],[70,56,44]],
+  [[204,244,252],[180,226,240],[150,200,220],[120,172,196],[94,140,166],[70,110,134],[50,84,106],[34,60,78]],
+];
+
+/** 确定性伪随机：同一次游玩里序列稳定（可复现），但看不出规律 */
+function meteorRand(k, salt) {
+  let h = (Math.imul(k + 1, 374761393) + Math.imul(salt, 668265263)) >>> 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177) >>> 0;
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
+/** 第 k 个时间槽里的流星；返回 null = 这一槽没有（这就是"不定时"的来源） */
+function meteorOf(k) {
+  const C = METEOR_CFG;
+  /* 开局前两个槽**必定**有流星：纯概率抽签时实测第一颗落在 13.0s，
+     玩家可能十几秒都看不到一颗 —— 而"背景里有东西在飞"恰好要在他还没投入时先建立。
+     之后恢复抽签（这才是"不定时"）。 */
+  if (k >= 2 && meteorRand(k, 1) > C.CHANCE) return null;
+  const life = C.LIFE0 + meteorRand(k, 3) * (C.LIFE1 - C.LIFE0);
+  const t0 = k * C.SLOT + meteorRand(k, 2) * (C.SLOT - life);
+  const spd = C.SPD0 + meteorRand(k, 4) * (C.SPD1 - C.SPD0);
+  const ang = C.ANG0 + meteorRand(k, 5) * (C.ANG1 - C.ANG0);
+  const left = meteorRand(k, 6) < 0.42;                       // 42% 向左下，其余向右下
+  /* 起点必须落在**屏幕内**（玩家要求"从屏幕内不同位置划过"），并按飞行方向留出射程：
+     向左下的从右半屏出发、向右下的从左半屏出发，保证它真的横穿画面而不是刚冒头就出界。
+     再加一个 hash 抖动，让连续两颗不会落在相近的位置。 */
+  const x0 = CFG.W * ((left ? 0.45 : 0.05) + meteorRand(k, 7) * 0.5);
+  return {
+    t0, life, spd, trail: spd * C.TRAIL,
+    dx: (left ? -1 : 1) * Math.cos(ang), dy: Math.sin(ang),
+    x0, y0: C.Y0 + meteorRand(k, 8) * (C.Y1 - C.Y0),
+    tint: METEOR_TINT[Math.floor(meteorRand(k, 9) * METEOR_TINT.length)],
+  };
+}
+
+/** 天体调色板生成：给定基色，派生 4 级明暗（高光 → 暗面）。
+ *  ★ 高光必须**按通道最大值归一化**：直接乘系数会让某个通道越过 255，
+ *    被 canvas 夹住后高光整团糊成白粉。实测基础色 #c98a5a 的红通道
+ *    201×1.30+26 = 287 → 夹成 255，看着不像"被照亮"而像"糊了一块"。
+ *    归一化只在越界时统一缩放，色相保持不变。 */
+function bodyTones(col) {
+  const c = hexToRgb(col);
+  const build = (ks, add) => {
+    const v = [c[0] * ks[0] + add, c[1] * ks[1] + add, c[2] * ks[2] + add];
+    const peak = Math.max(v[0], v[1], v[2], 1);
+    const k = peak > 255 ? 255 / peak : 1;
+    return [Math.round(v[0] * k), Math.round(v[1] * k), Math.round(v[2] * k)];
+  };
+  return {
+    lit:  build([1.34, 1.28, 1.14], 22),   // 受光面：提亮 + 少量暖白
+    mid:  build([0.92, 0.94, 1.00], 0),    // 中间调
+    dark: build([0.50, 0.52, 0.64], 0),    // 暗面：压暗并偏冷
+    rim:  build([0.24, 0.26, 0.38], 0),    // 边缘/轮廓
+  };
+}
+const BODY_PAL = {};
+function bodyPal(col) { return BODY_PAL[col] || (BODY_PAL[col] = bodyTones(col)); }
+
+/** 像素球：逐格算"这一格朝不朝向光源"，映射到 4 级明暗 + 抖动。
+ *  d 取**格子中心到球心的距离**（格为单位），而不是逻辑像素 —— 抖动要对齐到格。 */
+function drawPixelOrb(cx, cy, rCells, col, light, opt) {
+  if (rCells < 1) return;
+  const T = bodyPal(col);
+  const S = BODY_PX;
+  const lx = light ? light[0] : -0.35, ly = light ? light[1] : -0.35;
+  const ln = Math.hypot(lx, ly) || 1;
+  const ux = lx / ln, uy = ly / ln;
+  const r = Math.max(0.5, rCells - 0.45);                 // 略收，让边缘落在格内而不是整格
+  const n = Math.ceil(r);
+  const o = opt || {};
+  ctx.fillStyle = null;                                   // 逐格换色，不走 fillStyle 缓存
+  for (let gy = -n; gy <= n; gy++) {
+    for (let gx = -n; gx <= n; gx++) {
+      const d = Math.sqrt(gx * gx + gy * gy);
+      if (d > r) continue;
+      /* l ∈ [-1,1]：+1 = 正对光源 */
+      const l = (d < 1e-6) ? 1 : (-gx * ux - gy * uy) / d;
+      const check = (((gx + gy) % 2) + 2) % 2;            // 棋盘抖动
+      let c;
+      if (o.forceDark) c = T.rim;
+      else if (l > 0.42) c = T.lit;
+      else if (l > 0.02) c = T.lit;                       // 受光面保持一整片，避免碎
+      else if (l > -0.16) c = check ? T.lit : T.mid;      // 明→中 抖动带
+      else if (l > -0.52) c = T.mid;
+      else if (l > -0.74) c = check ? T.mid : T.dark;     // 中→暗 抖动带
+      else c = (d > r - 0.85) ? T.rim : T.dark;           // 暗面边缘略压深，给一点体积感
+      ctx.fillStyle = "rgb(" + c[0] + "," + c[1] + "," + c[2] + ")";
+      ctx.fillRect(Math.round(cx + gx * S), Math.round(cy + gy * S), S, S);
+    }
+  }
+}
+
+/** 气态行星的云带：一条横向的浅色像素带（按行取格，带内独立明暗）。 */
+function drawPixelBand(cx, cy, rCells, col, bandAt, light) {
+  const T = bodyPal(col);
+  const S = BODY_PX;
+  const r = Math.max(0.5, rCells - 0.45);
+  const lx = light ? light[0] : -0.35, ly = light ? light[1] : -0.35;
+  const ln = Math.hypot(lx, ly) || 1, ux = lx / ln, uy = ly / ln;
+  const y0 = Math.round(rCells * (bandAt - 0.16)), y1 = Math.round(rCells * (bandAt + 0.16));
+  for (let gy = y0; gy <= y1; gy++) {
+    for (let gx = -Math.ceil(r); gx <= Math.ceil(r); gx++) {
+      const d = Math.sqrt(gx * gx + gy * gy);
+      if (d > r) continue;
+      const l = (d < 1e-6) ? 1 : (-gx * ux - gy * uy) / d;
+      const c = l > 0.0 ? T.lit : T.mid;                  // 云带比周围亮一档
+      const cc = (((gx + gy) % 2) + 2) % 2 ? c : T.mid;   // 轻微抖动，避免成一条实心横杠
+      ctx.fillStyle = "rgb(" + cc[0] + "," + cc[1] + "," + cc[2] + ")";
+      ctx.fillRect(Math.round(cx + gx * S), Math.round(cy + gy * S), S, S);
+    }
+  }
+}
+
+/** 像素椭圆环：逐格判断是否落在 [rIn, rOut] 的椭圆带里，带内轻微抖动出纹理。 */
+function drawPixelRing(cx, cy, rInCells, rOutCells, squash, col, half) {
+  const T = bodyPal(col);
+  const S = BODY_PX;
+  const n = Math.ceil(rOutCells);
+  for (let gy = -n; gy <= n; gy++) {
+    if (half === "front" && gy < 0) continue;              // 只画下半（绕到行星前方的那半）
+    if (half === "back" && gy >= 0) continue;              // 只画上半（在行星背后）
+    for (let gx = -n; gx <= n; gx++) {
+      const d = Math.sqrt(gx * gx + (gy / squash) * (gy / squash));
+      if (d < rInCells || d > rOutCells) continue;
+      const cc = (((gx + gy) % 2) + 2) % 2 ? T.mid : T.dark;   // 环本身也有明暗纹理
+      ctx.fillStyle = "rgb(" + cc[0] + "," + cc[1] + "," + cc[2] + ")";
+      ctx.fillRect(Math.round(cx + gx * S), Math.round(cy + gy * S), S, S);
+    }
+  }
+}
+
+/** 黑洞：像素视界（纯暗）+ 一圈放大的吸积环。
+ *  两个像素画的要点：
+ *   ① 环用**圆盘减圆盘**（而不是细环带）：细环带在 r=5 时只有 1 格宽，看着像"描边"不像吸积盘；
+ *   ② 外面再铺一层**比底色更暗的暗晕** —— 深空里一个纯黑的东西没有轮廓就等于看不见，
+ *      有了这圈"更暗的边"它才读得出是个"洞"。底色用 skyColorAt 现算。 */
+function drawPixelHole(cx, cy, rCells, col, squash) {
+  const T = bodyPal(col);
+  const S = BODY_PX;
+  const R = rCells;
+  const bg = skyColorAt(clamp(cy / CFG.H, 0, 1));
+  const halo = [Math.round(bg[0] * 0.30), Math.round(bg[1] * 0.32), Math.round(bg[2] * 0.42)];
+  const put = (gx, gy, c) => {
+    ctx.fillStyle = "rgb(" + c[0] + "," + c[1] + "," + c[2] + ")";
+    ctx.fillRect(Math.round(cx + gx * S), Math.round(cy + gy * S), S, S);
+  };
+  const R2 = R + 3;
+  for (let gy = -R2; gy <= R2; gy++) {
+    for (let gx = -R2; gx <= R2; gx++) {
+      const d = Math.sqrt(gx * gx + gy * gy);
+      if (d > R2) continue;
+      if (d <= R - 1.5) { put(gx, gy, [3, 4, 10]); continue; }               // 视界：几乎全黑
+      if (d <= R) { put(gx, gy, T.lit); continue; }                          // 视界边缘的强光
+      if (d <= R + 1.6) { put(gx, gy, (((gx + gy) % 2) + 2) % 2 ? T.mid : T.lit); continue; }  // 吸积盘内圈
+      if (d <= R + 2.4) { put(gx, gy, (((gx + gy) % 2) + 2) % 2 ? T.dark : T.mid); continue; } // 吸积盘外圈（抖动着淡出）
+      if (d <= R2) { put(gx, gy, halo); continue; }                          // 暗晕：让"洞"有轮廓
+    }
+  }
+}
+
+/** 把全部天体画出来。星环分两遍（后半 → 行星 → 前半），才有"环穿过行星前面"的前后关系。 */
+function drawBodies() {
+  const W = CFG.W;
+  for (const b of BODIES) {
+    const span = W + b.r * BODY_PX * 8;
+    const bx = ((b.x - G.camera * b.par) % span + span) % span - b.r * BODY_PX * 4;
+    const reach = b.r * BODY_PX * 4;
+    if (bx < -reach || bx > W + reach) continue;           // 屏外直接跳过
+
+    if (b.type === "sun") {
+      /* 只有恒星的"光晕"是柔的（本来就是光），核心仍是一个像素球 */
+      drawSoftPatchRaw(bx, b.y, b.halo, b.halo, b.col, 0.30);
+      drawPixelOrb(bx, b.y, b.r, b.col, [-0.3, -0.3]);
+      continue;
+    }
+
+    if (b.type === "blackhole") { drawPixelHole(bx, b.y, b.r, b.col, b.squash); continue; }
+
+    if (b.type === "ringed") {
+      drawPixelRing(bx, b.y, b.r + 2, b.r + 5, b.squash, b.col, "back");
+      drawPixelOrb(bx, b.y, b.r, b.col, b.light);
+      drawPixelRing(bx, b.y, b.r + 2, b.r + 5, b.squash, b.col, "front");
+      continue;
+    }
+
+    drawPixelOrb(bx, b.y, b.r, b.col, b.light);
+    if (b.type === "gas" && b.band !== undefined) drawPixelBand(bx, b.y, b.r, b.col, b.band, b.light);
+  }
+}
+
+/** 流星绘制：把"当前时刻还活着的那 1~2 颗"画出来。
+ *  ★ 尾巴必须**首尾相接**，不能是一串孤立的点：第一版写成"每格走 6px、格子本身只有
+ *    BODY_PX=2px"，66% 是空隙，放大一看是**一条虚线**，完全不像流星
+ *    （像素画的斜线就是靠阶梯方块拼的，**步长必须 < 格宽**才连得起来）。
+ *    现在步长 4px / 格宽 5px，方向任意时两轴位移都小于格宽，故阶梯必然重叠。
+ *  亮度不掉 RGB，而是**沿固定色阶往下走**（亮起快 0.12s、末段加速掉档 = 烧尽），
+ *  这样每个画出来的颜色都是 METEOR_TINT 里的常量，可一眼核对不撞判据色（AGENTS #20）。
+ *  尾巴沿 −方向 铺阶梯：步长 4 < 格宽 5 ⇒ 首尾相接，不会断成虚线（§5.14 坑三）。 */
+function drawMeteors() {
+  const C = METEOR_CFG, t = G.elapsed;
+  const css = c => "rgb(" + c[0] + "," + c[1] + "," + c[2] + ")";
+  const N = METEOR_TINT[0].length - 1;
+  /* 只有寿命窗口内的槽可能有活流星 —— 最多查 3 个槽，不为流星维护任何列表 */
+  const kHi = Math.floor(t / C.SLOT);
+  const kLo = Math.max(0, Math.floor((t - C.LIFE1) / C.SLOT));
+  for (let k = kLo; k <= kHi; k++) {
+    const m = meteorOf(k);
+    if (!m) continue;
+    const age = t - m.t0;
+    if (age < 0 || age > m.life) continue;
+    const p = age / m.life;                                   // 0 = 刚亮，1 = 烧尽
+    const b = Math.min(1, age / 0.12) * (1 - p * p);           // 光变曲线：快起、慢灭
+    const lv = Math.round((1 - b) * N);
+    const cells = Math.max(3, Math.round((m.trail * Math.min(1, age / 0.10)) / C.STEP));
+    const hx = Math.round(m.x0 + m.dx * m.spd * age);
+    const hy = Math.round(m.y0 + m.dy * m.spd * age);
+    if (hx < -m.trail || hx > CFG.W + m.trail || hy < -40 || hy > CFG.H + 40) continue;
+    ctx.fillStyle = css(m.tint[lv]);
+    const hs = C.CELL + 2;                                     // 头部比尾巴大一圈
+    ctx.fillRect(hx - 1, hy - 1, hs, hs);
+    for (let i = 1; i < cells; i++) {
+      const off = i * C.STEP;
+      ctx.fillStyle = css(m.tint[Math.min(N, lv + i)]);   // ★ 必须夹到 N（= length-1）：
+      ctx.fillRect(Math.round(hx - m.dx * off), Math.round(hy - m.dy * off), C.CELL, C.CELL);
+    }                                                     //   写成 N+1 会取到 undefined，
+                                                          //   浏览器里第一颗流星的尾巴就会抛错
+  }
+}
+
+/** 三层星场：按视差滚动 + 轻微闪烁（只改亮度不改位置，避免抖动） */
+function drawStars() {
+  const W = CFG.W, t = G.elapsed;
+  for (const s of STARS) {
+    let x = (s.x - G.camera * s.par) % W;
+    if (x < 0) x += W;
+    const k = 0.62 + 0.38 * Math.sin(t * s.tw + s.ph);
+    ctx.fillStyle = "rgb(" +
+      Math.round(s.col[0] * k) + "," + Math.round(s.col[1] * k) + "," + Math.round(s.col[2] * k) + ")";
+    ctx.fillRect(Math.round(x), Math.round(s.y), s.size, s.size);
+  }
+}
+
+
+/** 障碍：悬顶块 = 上方星云岩体；地面柱 = 下方星云岩体。
+    两者朝向可通过区间的那条边都有高亮光边 —— 让玩家一眼看出哪里致命。 */
+function drawObstacles() {
+  const W = CFG.W, H = CFG.H;
+  for (const o of G.obstacles) {
+    const sx = Math.round(o.x - o.w / 2 - G.camera);
+    const sw = Math.round(o.w);
+    if (sx > W || sx + sw < 0) continue;
+    const bx = Math.round(o.x - o.w / 2);               // 用世界 x 做条纹相位，滚动时不闪
+
+    /* 条纹：**右边缘必须与块体的危险端对齐**。
+       相位用世界 x，所以滚动时条纹不会闪。
+       END = 9 的意思是最右那条条纹的右边缘落在 (w-9) 处 —— 与下面块体止于 w-9 一致。 */
+    const END = 9;
+    const stripes = (x0, y0, hgt, w) => {
+      ctx.fillStyle = "#1b2350";
+      const off = (((bx % 12) + 12) % 12 - END + 12) % 12;
+      for (let ix = off; ix < w - 1; ix += 6) {
+        const run = Math.min(3, w - END - ix);
+        if (run > 0) ctx.fillRect(x0 + ix, y0, run, hgt);
+      }
+    };
+
+    /* ---- 悬顶块：从屏幕顶往下长，**块体止于 plateBottom - 9** ----
+       这里有一个曾经把整个画面搞错的坐标系 bug，务必看清：
+         plateBottom 是**世界坐标（y 向上）**，而 fillRect 用的是**画布坐标（y 向下）**，
+         唯一的换算就是 H - y。
+       旧代码写成 `fillRect(sx, 0, sw, H - pb)` —— 直接从屏幕顶量 pb 像素，
+       等于把块体画成了 `画布 [0, pb]`，而危险边画在 `画布 pb-2`。
+       两者差了 `pb - (H - pb) = 2·pb - H`：pb 比 H/2 小多少，块体就短多少、
+       粉线就悬空多少（pb=287 时是 34px 的空档）。
+       玩家看到的"粉色边缘跑到错误位置"，其实就是这条悬空的粉线。 */
+    const pb = clamp(o.plateBottom, 0, H);
+    const plateBottomPx = H - pb;         // 画布坐标：块体下沿
+    if (plateBottomPx > END) {
+      ctx.fillStyle = "#131a3c";
+      ctx.fillRect(sx, 0, sw, plateBottomPx - END);          // 块体
+      stripes(sx, 0, plateBottomPx - END, sw);               // 条纹
+      ctx.fillStyle = "#3a2a5e";                             // 靠近危险边的亮带
+      ctx.fillRect(sx, plateBottomPx - END, sw, 8);
+      ctx.fillStyle = "#ff5a7a";                             // 危险边
+      ctx.fillRect(sx, plateBottomPx - 2, sw, 2);
+      ctx.fillStyle = "#ffd0dc";
+      ctx.fillRect(sx, plateBottomPx - 1, sw, 1);
+    }
+
+    // ---- 地面柱：从屏幕底往上长，块体止于 pillarTop + 9 ----
+    const pt = clamp(o.pillarTop, 0, H);
+    const pillarTopPx = H - pt;           // 画布坐标：柱顶
+    if (pt > END) {
+      ctx.fillStyle = "#131a3c";
+      ctx.fillRect(sx, pillarTopPx + END, sw, H - pillarTopPx - END);
+      stripes(sx, pillarTopPx + END, H - pillarTopPx - END, sw);
+      ctx.fillStyle = "#3a2a5e";
+      ctx.fillRect(sx, pillarTopPx, sw, 8);
+      ctx.fillStyle = "#ff5a7a";
+      ctx.fillRect(sx, pillarTopPx, sw, 2);
+      ctx.fillStyle = "#ffd0dc";
+      ctx.fillRect(sx, pillarTopPx + 1, sw, 1);
+    }
+  }
+}
+
+/** 死亡线：上下两条能量边界。必须比星空亮得多（可读性硬要求） */
+function drawDeathLines() {
+  const W = CFG.W, H = CFG.H, t = G.elapsed;
+  const pulse = 0.75 + 0.25 * Math.sin(t * 3.4);
+  const off = ((G.camera * 0.6) % 24 + 24) % 24;
+  for (const top of [true, false]) {
+    const yb = top ? 0 : H - 8;
+    ctx.fillStyle = "#1a0820"; ctx.fillRect(0, yb, W, 8);
+    ctx.fillStyle = "rgb(" + Math.round(120 * pulse) + "," + Math.round(18 * pulse) + "," + Math.round(58 * pulse) + ")";
+    for (let x = -24; x < W + 24; x += 24) {
+      ctx.fillRect(Math.round(x - off), yb + (top ? 5 : 0), 12, 3);
+    }
+    ctx.fillStyle = "rgb(" + Math.round(255 * pulse) + "," + Math.round(72 * pulse) + "," + Math.round(112 * pulse) + ")";
+    ctx.fillRect(0, top ? 6 : yb + 1, W, 2);
+    ctx.fillStyle = "#ffe6ee";
+    ctx.fillRect(0, top ? 7 : yb + 2, W, 1);
+  }
+}
+
+/** 像素 HUD
+ *  所有元素都限制在 [HUD_SAFE, W - HUD_SAFE] 之内：
+ *  画布以 cover 方式铺满窗口、两侧会被裁切，贴边内容会在窄窗口下被切掉。
+ */
+function drawHudPixels() {
+  const S = 2;
+  const xL = CFG.HUD_SAFE + CFG.HUD_PAD;          // 左列左边缘
+  const xR = CFG.W - CFG.HUD_SAFE - CFG.HUD_PAD;  // 右列右边缘
+  drawText("TO THE STARS", xL, 14, S, "#ffd45a");
+  drawText(G.score.toFixed(1) + "M", xL, 34, S, "#e8f2ff");
+  drawText("BEST " + G.best.toFixed(1) + "M", xL, 52, S, "#8ea8d8");
+
+  // 难度条：直观表达"可通过区间正在变窄"（难度按距离算，所以传 score 而不是 elapsed）
+  const k = difficulty(G.score);
+  const bw = 132, bh = 12, bx = xR - bw, by = 14;
+  ctx.fillStyle = "#2a3560"; ctx.fillRect(bx - 2, by - 2, bw + 4, bh + 4);   // 外框，让空槽也看得出是"计量条"
+  ctx.fillStyle = "#0d1330"; ctx.fillRect(bx, by, bw, bh);
+  const segs = 12, sw = (bw - 4) / segs, on = Math.round(k * segs);
+  for (let i = 0; i < segs; i++) {
+    /* 高难度格用 #ff6a8c —— **刻意不用 #ff5a7a**：
+       那个色同时也是"障碍危险边"与"死亡线满脉冲"的颜色，而死亡线是一条横贯
+       x=0..960 的线，脉冲峰值时算出的 RGB 恰好等于 #ff5a7a ⇒
+       __shot.js 的 HUD 安全区判据（按调色板白名单扫顶部 100 行）会误命中它，
+       报出 "HUD 横向范围 x ∈ [0, 663]" 的**假故障**（实测 6 次里有 3 次，
+       越界值在 0/18/21 之间跳）。给 HUD 一格独占色是最省的解法。 */
+    ctx.fillStyle = i < on ? (i < 5 ? "#5ad2ff" : i < 9 ? "#ffd45a" : "#ff6a8c") : "#161e42";
+    ctx.fillRect(bx + 2 + i * sw, by + 2, sw - 2, bh - 4);
+  }
+  drawText("DIFFICULTY", xR, by + bh + 8, S, "#8ea8d8", "right");
+}
+
+
+function render() {
+  drawNebulaBase();
+  drawBodies();          // 天体在星场**之下**：远星从行星前面掠过，空间层次才成立
+  drawStars();
+  drawMeteors();         // 流星在障碍**之下**：第 14 轮从"死亡线之上"挪到这里 ——
+                         // 它现在会横穿整屏，压在障碍上就会遮住危险边（可读性优先，§0.8.3）
+  drawObstacles();
+  drawDeathLines();
+  drawParticles();
+  drawShip();
+
+  // 调试：C 键显示碰撞盒轮廓，逐帧核对视觉与判定
+  if (G.showHitbox) {
+    ctx.strokeStyle = "#00ff88";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(PX0 + 0.5, CFG.H - (G.py + CFG.PH) + 0.5, CFG.PW - 1, CFG.PH - 1);
+  }
+  drawHudPixels();
+}
+
+/** 飞船：与碰撞盒中心对齐（"视觉 == 碰撞"铁律），带俯仰倾斜与尾焰闪烁 */
+function drawShip() {
+  const sSize = SHIP.w * CFG.PIXEL;
+  const sCx = PX0 + CFG.PW / 2;
+  const sCy = CFG.H - (G.py + CFG.PH / 2);
+  const sLeft = Math.round(sCx - sSize / 2);
+  const sTop = Math.round(sCy - sSize / 2);
+
+  /* 俯仰倾斜：竖直速度越大越抬头/低头。
+     被"早按无效"打回时强制低头 —— 本作最反直觉规则的即时否定反馈。 */
+  let shear = clamp(-G.vy / 900, -0.34, 0.34);
+  if (G.invalidFlash > 0) shear = 0.5;
+  if (G.state === ST.READY || G.state === ST.OVER) shear = 0;
+
+  const flameOn = (Math.floor(performance.now() / 70) % 2) === 0;
+  const sp = flameOn ? SHIP : SHIP_NOFLAME;
+
+  /* 倾斜实现：逐列绘制，每列按其所属行加竖直偏移。
+     不做真正的旋转 —— 旋转会产生非整数像素，破坏像素风的锐度。 */
+  const mid = (sp.h - 1) / 2;
+  for (let y = 0; y < sp.h; y++) {
+    const dy = Math.round((y - mid) * shear) * CFG.PIXEL;
+    for (let x = 0; x < sp.w; x++) {
+      const c = sp.grid[y][x];
+      if (!c) continue;
+      ctx.fillStyle = "rgb(" + c[0] + "," + c[1] + "," + c[2] + ")";
+      ctx.fillRect(sLeft + x * CFG.PIXEL, sTop + y * CFG.PIXEL + dy, CFG.PIXEL, CFG.PIXEL);
+    }
+  }
+}
+
+
+/* ------------------------------ HUD 与覆盖层 ------------------------------ */
+let lastRunInfo = null;      // 上一局的遥测结果，用于结算页显示一句诊断
+
+function renderUI() {
+  /* 游戏内 HUD 已经全部搬到画布上用像素字绘制（见 drawHudPixels）。
+     这里**只负责状态覆盖层**（开始 / 暂停 / 结算）。
+     早期版本同时往 DOM 的 #hud 里写一套调试文本，结果两套文字叠在一起、
+     并且被画布的 cover 缩放一起放大 —— 已在美术阶段移除。 */
+  let txt = "";
+  if (G.state === ST.READY) {
+    txt = "<span class='big'>TO THE STARS</span>\n" +
+          "SPACE / CLICK / TAP  TO START\n" +
+          "点按上升，松手下坠 —— 想停在空中就要持续点按\n" +
+          "不要碰上下边界\n" +
+          "M 静音　C 显示判定框　H 游玩数据面板";
+  } else if (G.state === ST.PAUSED) {
+    txt = "<span class='big'>PAUSED</span>\n空格或点击继续";
+  } else if (G.state === ST.OVER) {
+    txt = "<span class='big'>" + G.reason + "</span>\n" +
+          "本局 " + G.score.toFixed(1) + " m　　上一局 " + G.lastScore.toFixed(1) + " m\n" +
+          "最佳 " + G.best.toFixed(1) + " m" + (G.score >= G.best && G.score > 0 ? "　[新纪录]" : "") + "\n" +
+          (lastRunInfo ? "<span style='font-size:13px;color:#aaa'>" + lastRunInfo + "</span>\n" : "") +
+          "空格 / 点击 重新开始　　H 键 看数据面板";
+  }
+  overlayEl.innerHTML = txt;
+  overlayEl.classList.toggle("hidden", txt === "");
+}
+
+/* ======================================================================
+   遥测面板（H 键）
+   ====================================================================== */
+const telEl = document.getElementById("tel");
+let telOpen = false;
+
+function toggleTelemetry() {
+  telOpen = !telOpen;
+  if (telOpen) {
+    if (G.state === ST.PLAYING) G.state = ST.PAUSED;       // 打开面板即暂停，避免边看边死
+    renderTelemetryPanel();
+  } else {
+    telEl.classList.remove("open");
+  }
+}
+
+function fmtPct(x) { return (x * 100).toFixed(0) + "%"; }
+function fmtVal(x) { return (x === null || x === undefined) ? "—" : String(x); }
+
+function renderTelemetryPanel() {
+  const rs = Telemetry.session.runs;
+  const S = Telemetry.sessionSummary();
+
+  /* --- 近期逐局表 --- */
+  const recent = rs.slice(-12).reverse();
+  let rows = "";
+  for (const r of recent) {
+    const tone = r.duration >= 30 ? "ok" : r.duration >= 12 ? "warn" : "bad";
+    rows += "<tr>" +
+      "<td class='l'>" + r.date + "</td>" +
+      "<td class='" + tone + "'>" + r.duration.toFixed(1) + "</td>" +
+      "<td>" + r.distance.toFixed(1) + "</td>" +
+      "<td class='l'>" + r.reason + "</td>" +
+      "<td>" + fmtVal(r.passed) + "</td>" +
+      "<td>" + fmtVal(r.taps) + "</td>" +
+      "<td>" + fmtVal(r.invalid) + "</td>" +
+      "<td>" + fmtVal(r.avgHeight) + "</td>" +
+      "<td>" + fmtVal(r.minGapSpire) + "</td>" +
+      "<td>" + fmtVal(r.minGapPlate) + "</td>" +
+      "</tr>";
+  }
+  if (!rows) rows = "<tr><td class='l' colspan='10' class='hint'>暂无记录 —— 玩几局再按 H</td></tr>";
+
+  /* --- 汇总 --- */
+  let sum = "<p class='hint'>暂无样本</p>";
+  if (S) {
+    const rc = Object.keys(S.reasonCount).map(k => k + " × " + S.reasonCount[k]).join("　");
+    sum =
+      "<table><tr><th class='l'>样本</th><td>" + S.runs + " 局</td>" +
+      "<th class='l'>存活中位数 / 最长</th><td>" + S.durMed + "s / " + S.durMax + "s</td>" +
+      "<th class='l'>距离中位数 / 最远</th><td>" + S.distMed + "m / " + S.distMax + "m</td></tr>" +
+      "<tr><th class='l'>失败分布</th><td class='l' colspan='5'>" + rc + "</td></tr>" +
+      "<tr><th class='l'>点按频率</th><td>" + S.tapsPerSec + " 次/秒</td>" +
+      "<th class='l'>有效 / 无效</th><td>" + S.tapTotal + " / " + S.invalidTotal + "（无效率 " + fmtPct(S.invalidRate) + "）</td>" +
+      "<th class='l'>障碍通过率</th><td>" + fmtPct(S.passRate) + "</td></tr>" +
+      "<tr><th class='l'>平均高度</th><td>" + S.avgHeight + " / 540</td>" +
+      "<th class='l'>最小间隙中位数（柱 / 板）</th><td colspan='3'>" + fmtVal(S.gapSpire) + " / " + fmtVal(S.gapPlate) + "</td></tr></table>";
+  }
+
+  /* --- 自动诊断 --- */
+  let diag = "";
+  const all = (S ? S.verdicts : []).concat(Telemetry.session.runs.slice(-1).flatMap(r => r.diagnosis || []));
+  const seen = new Set();
+  for (const v of all) {
+    if (seen.has(v.text)) continue;
+    seen.add(v.text);
+    diag += "<li class='" + v.level + "'>" + v.text + "</li>";
+  }
+  if (!diag) diag = "<li class='hint'>暂无可诊断结论</li>";
+
+  /* --- 当前配置 --- */
+  const c = Telemetry.session.config || Telemetry.configSnapshot();
+  const fmtPair = a => Array.isArray(a) ? a.join("→") : String(a);
+  const cfgLine = "v0=" + c.V0 + "　g=" + c.G + "　apex=" + c.apex + "　" +
+    "区间高度=" + c.gapHi + "→" + c.cap13 + "（屏高 " + (c.cap13 / CFG.H * 100).toFixed(1) + "%）　" +
+    "难度达峰=" + c.diffRampM + "m（幂 " + c.diffPow + "）";
+
+  telEl.innerHTML =
+    "<h3>游玩数据面板　<span class='hint'>（本局配置：" + cfgLine + "）</span></h3>" +
+    "<div class='bar'>" +
+      "<button id='telExport'>导出 JSON（复制到剪贴板）</button>" +
+      "<button id='telClear'>清空全部记录</button>" +
+      "<button id='telClose'>关闭（H）</button>" +
+      "<span class='hint' style='align-self:center'>导出的是汇总数据，不含逐帧采样，体积极小</span>" +
+    "</div>" +
+    "<h3>自动诊断与调参建议</h3><ul>" + diag + "</ul>" +
+    "<h3>会话汇总</h3>" + sum +
+    "<h3>近期逐局（最新在前）</h3>" +
+    "<table><tr>" +
+      "<th class='l'>时间</th><th>存活s</th><th>距离m</th><th class='l'>失败原因</th>" +
+      "<th>通过</th><th>有效点按</th><th>未生效点按</th><th>平均高度</th><th>柱间隙</th><th>板间隙</th>" +
+    "</tr>" + rows + "</table>" +
+    "<h3>原始数据预览（可直接复制给我）</h3>" +
+    "<pre>" + Telemetry.exportPayload().replace(/</g, "&lt;") + "</pre>";
+
+  telEl.classList.add("open");
+  document.getElementById("telClose").onclick = () => { telOpen = true; toggleTelemetry(); };
+  document.getElementById("telClear").onclick = () => {
+    Telemetry.session.runs = [];
+    Telemetry.save();
+    renderTelemetryPanel();
+  };
+  document.getElementById("telExport").onclick = () => {
+    const text = Telemetry.exportPayload();
+    const done = () => { document.getElementById("telExport").textContent = "已复制 ✓"; };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, () => fallbackCopy(text, done));
+    } else fallbackCopy(text, done);
+  };
+}
+
+function fallbackCopy(text, done) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed"; ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand("copy"); done(); } catch (e) { /* 忽略 */ }
+  document.body.removeChild(ta);
+}
+
+
+/* ------------------------------ 主循环 ------------------------------ */
+let last = performance.now() / 1000;
+
+function frame(nowMs) {
+  const now = nowMs / 1000;
+  let elapsed = now - last;
+  last = now;
+
+  if (G.state === ST.PLAYING) {
+    if (elapsed > CFG.MAX_FRAME) elapsed = CFG.MAX_FRAME;
+    let acc = elapsed;
+    while (acc > 0) { const d = Math.min(CFG.DT, acc); step(d); acc -= d; }
+  }
+  // 粒子在任何状态下都推进（暂停/结算时也让残留粒子自然消散）
+  const pdt = Math.min(elapsed, 0.05);
+  updateParticles(pdt);
+  render();
+  renderUI();
+  requestAnimationFrame(frame);
+}
+
+
+/* ------------------------------ 启动 ------------------------------ */
+resize();
+G.best = Store.read();
+Telemetry.load();                                            // 读取历史游玩记录
+Telemetry.session.config = Telemetry.configSnapshot();       // 绑定当前参数，便于后续对照
+toReady();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
