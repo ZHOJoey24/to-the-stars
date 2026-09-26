@@ -2,6 +2,8 @@
 
 **直接玩：https://zhojoey24.github.io/to-the-stars/**
 
+![TO THE STARS 封面](cover.png)
+
 单文件（零外部依赖、零素材文件）像素风空中悬停跑酷：角色固定在屏幕左侧一条竖线上，永不落地，
 靠**点按节奏**维持高度、穿过不断变窄的缝隙，撞上下死亡线或障碍即结束，分数 = 横向距离。
 
@@ -10,4 +12,5 @@
 - 调试键：`H` 游玩数据面板 / `C` 碰撞盒轮廓 / `M` 静音
 - 手机可玩（画布按 cover 铺满，点击即跳）
 
-`index.html` 与本地开发用的 `demo.html` 内容逐字节相同，由 `__publish.js` 发布。
+`index.html` 与本地开发用的 `demo.html` 内容逐字节相同，由 `__publish.js` 发布；
+`cover.png` 是 900×1200 的投稿封面，由 `__cover.js` 生成。
