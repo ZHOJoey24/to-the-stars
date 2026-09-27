@@ -709,6 +709,36 @@ const Telemetry = {
     };
   },
 
+  /** 把一条来路不明的记录洗成"面板与汇总都吃得下"的形状（第 18 轮复审补，AGENTS §5.18）。
+   *  为什么不能只校验 duration / distance（复审指出的漏洞）：
+   *   · 面板会把**最近一条记录**的 diagnosis 合并进结论列表并直接读 `v.text` / `v.level`
+   *     —— 一条 `{diagnosis:[null]}` 就能抛 TypeError；
+   *   · 汇总对 taps / invalid / passed / avgHeight 求和求中位数，字段缺失或类型不对会得到 NaN
+   *     （`"many" || 0` 仍是字符串，后续加法直接变成拼接）；
+   *   · date / reason / 诊断文本是拼进 innerHTML 的，手工改过的存档里带尖括号会破坏面板 DOM。
+   *  所以逐字段规范化：不合格的记录返回 null（调用方筛掉），其余字段给安全默认值。 */
+  cleanRun(r) {
+    if (!r || typeof r !== "object") return null;
+    if (!Number.isFinite(r.duration) || !Number.isFinite(r.distance)) return null;  // 面板对这两个没有兜底
+    const num = (v, dflt) => (Number.isFinite(v) ? v : dflt);
+    const numOrNull = (v) => (Number.isFinite(v) ? v : null);
+    const text = (v) => (v === undefined || v === null ? "" : String(v));
+    const LEVELS = { ok: 1, warn: 1, bad: 1, hint: 1 };
+    const diagnosis = (Array.isArray(r.diagnosis) ? r.diagnosis : [])
+      .filter(v => v && typeof v === "object" && typeof v.text === "string")
+      .map(v => ({ level: LEVELS[v.level] ? v.level : "hint", text: v.text }));
+    const heights = (Array.isArray(r.heights) ? r.heights : []).filter(Number.isFinite).slice(0, 4000);
+    return {
+      id: text(r.id), endedAt: text(r.endedAt), date: text(r.date), reason: text(r.reason),
+      duration: r.duration, distance: r.distance, heights: heights, diagnosis: diagnosis,
+      taps: num(r.taps, 0), invalid: num(r.invalid, 0), passed: num(r.passed, 0),
+      passRate: num(r.passRate, 0), mashRate: num(r.mashRate, 0), invalidRate: num(r.invalidRate, 0),
+      lowRatio: num(r.lowRatio, 0), ceilingRatio: num(r.ceilingRatio, 0),
+      avgHeight: numOrNull(r.avgHeight), firstReaction: numOrNull(r.firstReaction),
+      minGapSpire: numOrNull(r.minGapSpire), minGapPlate: numOrNull(r.minGapPlate)
+    };
+  },
+
   load() {
     try {
       const raw = localStorage.getItem(this.KEY);
@@ -717,16 +747,9 @@ const Telemetry = {
         if (d && Array.isArray(d.runs)) {
           this.session.sessionId = d.sessionId || this.newId();
           this.session.startedAt = d.startedAt || new Date().toISOString();
-          /* 逐条校验：旧结构 / 被截断 / 手改过的记录会让 H 面板在 duration.toFixed() 上抛错
-             （面板对 duration / distance 没有 fmtVal 兜底），所以先筛掉不合格记录、
-             再把 reason / date 规范成字符串。本地存储不可用时仍然静默降级。
-             （第 18 轮按外部审查补，AGENTS §5.18） */
-          this.session.runs = d.runs
-            .filter(r => r && typeof r === "object" && Number.isFinite(r.duration) && Number.isFinite(r.distance))
-            .map(r => Object.assign({}, r, {
-              reason: String(r.reason === undefined || r.reason === null ? "" : r.reason),
-              date: String(r.date === undefined || r.date === null ? "" : r.date)
-            }));
+          /* 逐条"洗"过再用：旧结构 / 被截断 / 被手工改过的记录会让 H 面板抛错或显示 NaN，
+             具体洗哪些字段见 cleanRun() 的注释。本地存储不可用时仍然静默降级。 */
+          this.session.runs = d.runs.map(r => this.cleanRun(r)).filter(Boolean);
         }
       }
     } catch (e) { /* 本地存储不可用则仅内存记录 */ }
@@ -928,7 +951,7 @@ const Telemetry = {
       durMed: +durMed.toFixed(1),
       durMax: +durSorted[durSorted.length - 1].toFixed(1),
       distMed: +med(rs.map(r => r.distance)).toFixed(1),
-      distMax: Math.max(...rs.map(r => r.distance)).toFixed(1),
+      distMax: +Math.max(...rs.map(r => r.distance)).toFixed(1),
       tapsPerSec: +(sum("taps") / Math.max(1, sum("duration"))).toFixed(2),
       tapTotal: sum("taps"),
       invalidTotal: sum("invalid"),
@@ -2279,6 +2302,13 @@ function toggleTelemetry() {
 function fmtPct(x) { return (x * 100).toFixed(0) + "%"; }
 function fmtVal(x) { return (x === null || x === undefined) ? "—" : String(x); }
 
+/** 拼进 innerHTML 之前先转义（第 18 轮复审补）。
+ *  记录可能来自被手工改过的本地存储，date / reason / 诊断文本里带尖括号会破坏面板 DOM
+ *  —— 导出预览那处早就做了 `.replace(/</g, "&lt;")`，这里把其余入口补齐、口径统一。 */
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
 function renderTelemetryPanel() {
   const rs = Telemetry.session.runs;
   const S = Telemetry.sessionSummary();
@@ -2289,10 +2319,10 @@ function renderTelemetryPanel() {
   for (const r of recent) {
     const tone = r.duration >= 30 ? "ok" : r.duration >= 12 ? "warn" : "bad";
     rows += "<tr>" +
-      "<td class='l'>" + r.date + "</td>" +
+      "<td class='l'>" + esc(r.date) + "</td>" +
       "<td class='" + tone + "'>" + r.duration.toFixed(1) + "</td>" +
       "<td>" + r.distance.toFixed(1) + "</td>" +
-      "<td class='l'>" + r.reason + "</td>" +
+      "<td class='l'>" + esc(r.reason) + "</td>" +
       "<td>" + fmtVal(r.passed) + "</td>" +
       "<td>" + fmtVal(r.taps) + "</td>" +
       "<td>" + fmtVal(r.invalid) + "</td>" +
@@ -2306,7 +2336,7 @@ function renderTelemetryPanel() {
   /* --- 汇总 --- */
   let sum = "<p class='hint'>暂无样本</p>";
   if (S) {
-    const rc = Object.keys(S.reasonCount).map(k => k + " × " + S.reasonCount[k]).join("　");
+    const rc = Object.keys(S.reasonCount).map(k => esc(k) + " × " + S.reasonCount[k]).join("　");
     sum =
       "<table><tr><th class='l'>样本</th><td>" + S.runs + " 局</td>" +
       "<th class='l'>存活中位数 / 最长</th><td>" + S.durMed + "s / " + S.durMax + "s</td>" +
@@ -2326,7 +2356,7 @@ function renderTelemetryPanel() {
   for (const v of all) {
     if (seen.has(v.text)) continue;
     seen.add(v.text);
-    diag += "<li class='" + v.level + "'>" + v.text + "</li>";
+    diag += "<li class='" + v.level + "'>" + esc(v.text) + "</li>";
   }
   if (!diag) diag = "<li class='hint'>暂无可诊断结论</li>";
 
