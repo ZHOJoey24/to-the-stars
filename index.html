@@ -682,7 +682,7 @@ const Telemetry = {
   KEY: "hover_runner_plays_v1",
   MAX_RUNS: 200,                 // 本地最多保留多少局
   SAMPLE_HZ: 8,                  // 高度采样频率
-  TARGET: { mash: 0.35, invalid: 0.30, pass: 0.70, minRuns: 4, shortRun: 8.0, rampT: 60 },
+  TARGET: { mash: 0.35, invalid: 0.30, pass: 0.70, minRuns: 4, shortRun: 8.0 },
 
   session: { sessionId: "", startedAt: "", config: null, runs: [] },
   cur: null,
@@ -895,10 +895,12 @@ const Telemetry = {
     } else if (isObs) {
       if (passRate < T.pass && passed <= 3) {
         v.push({ level: "bad", text: "早期就被障碍物撞死（仅通过 " + passed + " 个）—— 开局难度偏高：" +
-          "建议把 GOPEN 的开局柱高/板底再放宽，或把难度爬升从 120s 拉长到 180s" });
+          "建议放宽开局缝高上限（GAP_HI " + CFG.GAP_HI + " → " + Math.round(CFG.GAP_HI * 1.15) + "），" +
+          "或把难度达峰距离拉长（DIFF_RAMP " + CFG.DIFF_RAMP + "m → " + Math.round(CFG.DIFF_RAMP * 4 / 3) + "m）" });
       } else {
         v.push({ level: "warn", text: "撞到障碍物（已通过 " + passed + " 个）—— 属于正常的读牌失误；" +
-          "若这种死法占比超过一半，可考虑把 REACT 余量从 0.4s 提到 0.5s" });
+          "若这种死法占比超过一半，可考虑把反应余量 REACT 从 " + CFG.REACT.toFixed(2) + "s 提到 " +
+          (CFG.REACT + 0.1).toFixed(2) + "s" });
       }
     }
 
@@ -914,10 +916,13 @@ const Telemetry = {
         "%）—— 操作干脆，没有狂点行为" });
     }
 
-    /* 结论 3：通过率 → 障碍密度是否合适 */
+    /* 结论 3：单局通过了多少组障碍
+       ★ 这里原本还有一条 "通过率偏低 ⇒ 建议加大组间距" 的分支，第 19 轮删掉了：
+       单局的 passRate = passed/(passed+1)，而它只在 passed ≥ 6 时才走到，那时
+       passRate 恒 ≥ 6/7 ≈ 86% ⇒ 那条分支**永远不可能触发**（判据恒真，等于假话）。
+       密度类建议改由会话汇总按真分母 passTotal/(passTotal+局数) 给，见 sessionSummary。 */
     if (passed >= 6) {
-      if (passRate >= T.pass) v.push({ level: "ok", text: "障碍通过率 " + (passRate * 100).toFixed(0) + "% —— 生成器难度与玩家水平匹配" });
-      else v.push({ level: "warn", text: "障碍通过率仅 " + (passRate * 100).toFixed(0) + "% —— 偏难：建议把组间距下限从 1.0s 提到 1.15s" });
+      v.push({ level: "ok", text: "单局通过 " + passed + " 组障碍（点按通过率 " + (passRate * 100).toFixed(0) + "%）" });
     }
 
     /* 结论 4：高度分布 → 玩家实际在用哪段空间 */
@@ -976,7 +981,8 @@ const Telemetry = {
     if (n >= T.minRuns) {
       if (durMed < T.shortRun) {
         v.push({ level: "bad", text: "存活中位数仅 " + agg.durMed + "s（" + n + " 局）—— 整体偏难。" +
-          "按性价比排序：① 把难度爬升 120s → 180s；② 组间距下限 1.0s → 1.2s；③ 降低 apex" });
+          "按性价比排序：① 难度达峰 " + CFG.DIFF_RAMP + "m → " + Math.round(CFG.DIFF_RAMP * 4 / 3) + "m；" +
+          "② 组间距下限 GAP_MIN " + CFG.GAP_MIN.toFixed(2) + "s → " + (CFG.GAP_MIN + 0.2).toFixed(2) + "s；③ 降低 apex" });
       }
       if (ceilN >= n * 0.4) {
         v.push({ level: "bad", text: ceilN + "/" + n + " 局死于撞顶 —— 纵向空间不足或跳跃过强。" +
@@ -993,9 +999,13 @@ const Telemetry = {
       if (agg.passRate < T.pass && agg.passTotal > 0) {
         v.push({ level: "warn", text: "障碍通过率 " + (agg.passRate * 100).toFixed(0) + "% —— 偏难，优先加大组间距而非降低障碍高度" });
       }
-      const rampFull = rs.filter(r => r.duration >= T.rampT).length;
+      /* 难度自第 6 轮起按**距离**达峰（DIFF_RAMP 米），所以这里也按距离判。
+         旧的 "60s 难度爬升段" 是秒制时代的说法 —— 现在爬满 300m 要约 119s，
+         留着这句话会让人以为难度在 60 秒就顶格了（秒/米混用是本项目的老毛病）。 */
+      const rampHalf = Math.round(CFG.DIFF_RAMP * 0.5);
+      const rampFull = rs.filter(r => r.distance >= rampHalf).length;
       if (rampFull >= 2 && durMed >= T.shortRun) {
-        v.push({ level: "ok", text: "有 " + rampFull + " 局活过了 60s 难度爬升段 —— 难度曲线本身站得住" });
+        v.push({ level: "ok", text: "有 " + rampFull + " 局走过了难度爬升的一半（" + rampHalf + "m）—— 难度曲线本身站得住" });
       }
       if (ceilN <= n * 0.25 && floorN <= n * 0.25 && agg.invalidRate < 0.15 && durMed >= 25) {
         v.push({ level: "ok", text: "失败分布均匀、无狂点行为、存活中位数 " + agg.durMed + "s —— 当前参数配平良好，可以进入美术阶段" });
@@ -2258,6 +2268,16 @@ function drawShip() {
 /* ------------------------------ HUD 与覆盖层 ------------------------------ */
 let lastRunInfo = null;      // 上一局的遥测结果，用于结算页显示一句诊断
 
+/* 开发者模式（第 19 轮）：**发布版默认关闭**，链接带 ?dev=1 才打开。
+   诊断文本是"该调哪个参数、往哪调"的内部结论，通篇 v0 / apex / GAP_HI / DIFF_RAMP
+   这类黑话 —— 玩家截图反馈里出现的是"建议把 GOPEN 的开局柱高…从 120s 拉长到 180s"，
+   玩家看不懂也不该看到。本地调试打开 demo.html?dev=1 恢复全套建议。
+   刻意不做按键开关（会被误触，C / H 已经够多），也不拆两份文件 —— 单文件是硬约束 A2，
+   且 __publish.js 的逐字节校验前提就是"线上 == 本地"，拆两份必然漂移。 */
+function devOn() {
+  try { return /[?&]dev=1(&|#|$)/.test(String(window.location.search)); } catch (e) { return false; }
+}
+
 function renderUI() {
   /* 游戏内 HUD 已经全部搬到画布上用像素字绘制（见 drawHudPixels）。
      这里**只负责状态覆盖层**（开始 / 暂停 / 结算）。
@@ -2276,7 +2296,7 @@ function renderUI() {
     txt = "<span class='big'>" + G.reason + "</span>\n" +
           "本局 " + G.score.toFixed(1) + " m　　上一局 " + G.lastScore.toFixed(1) + " m\n" +
           "最佳 " + G.best.toFixed(1) + " m" + (G.score >= G.best && G.score > 0 ? "　[新纪录]" : "") + "\n" +
-          (lastRunInfo ? "<span style='font-size:13px;color:#aaa'>" + lastRunInfo + "</span>\n" : "") +
+          (lastRunInfo && devOn() ? "<span style='font-size:13px;color:#aaa'>" + lastRunInfo + "</span>\n" : "") +
           "空格 / 点击 重新开始　　H 键 看数据面板";
   }
   overlayEl.innerHTML = txt;
@@ -2375,7 +2395,7 @@ function renderTelemetryPanel() {
       "<button id='telClose'>关闭（H）</button>" +
       "<span class='hint' style='align-self:center'>导出的是汇总数据，不含逐帧采样，体积极小</span>" +
     "</div>" +
-    "<h3>自动诊断与调参建议</h3><ul>" + diag + "</ul>" +
+    (devOn() ? "<h3>自动诊断与调参建议</h3><ul>" + diag + "</ul>" : "") +
     "<h3>会话汇总</h3>" + sum +
     "<h3>近期逐局（最新在前）</h3>" +
     "<table><tr>" +
