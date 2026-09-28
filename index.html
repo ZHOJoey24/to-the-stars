@@ -727,7 +727,13 @@ const Telemetry = {
     const CNT = 1e6, DAY = 86400, DIST = 1e6;
     const num = (v, dflt, hi) => (Number.isFinite(v) && v >= 0 ? Math.min(v, hi) : dflt);
     const numOrNull = (v, hi) => (Number.isFinite(v) && v >= 0 ? Math.min(v, hi) : null);
-    const text = (v) => (v === undefined || v === null ? "" : String(v));
+    /* 文本字段**只接受原始值**（第 19 轮第二次复审 P2）。
+       不能直接 `String(v)`：JSON 里可以塞 `{"toString":null}`（或 toString 是数字），
+       这时 `String(v)` 会抛 TypeError「Cannot convert object to primitive value」——
+       而 load() 把整批记录放在同一个 map() 里，**一条坏记录就让整批历史都载不进来**
+       （外层 catch 静默吞掉），再存一局就把旧存档覆盖成空会话。宁可用空串也别炸。 */
+    const text = (v) => (typeof v === "string" ? v
+      : (typeof v === "number" && Number.isFinite(v)) || typeof v === "boolean" ? String(v) : "");
     const LEVELS = { ok: 1, warn: 1, bad: 1, hint: 1 };
     const diagnosis = (Array.isArray(r.diagnosis) ? r.diagnosis : [])
       .filter(v => v && typeof v === "object" && typeof v.text === "string")
@@ -758,8 +764,12 @@ const Telemetry = {
              具体洗哪些字段见 cleanRun() 的注释。本地存储不可用时仍然静默降级。 */
           /* 也要**先截到 MAX_RUNS 再洗**（第 19 轮复审 P3）：只有 finishRun() 会裁剪，
              而存档可能被手工改大 —— 一是汇总里的 Math.max(...arr) 在超大数组上会爆
-             运行时参数上限（H 面板直接抛错），二是启动时解析几千条记录纯属浪费。 */
-          this.session.runs = d.runs.slice(-this.MAX_RUNS).map(r => this.cleanRun(r)).filter(Boolean);
+             运行时参数上限（H 面板直接抛错），二是启动时解析几千条记录纯属浪费。
+             **逐条 try/catch**（第 19 轮第二次复审 P2）：cleanRun 现在自己不抛了，
+             但"一条坏记录连累整批"这种故障必须在这一层彻底隔离 —— 单条失败只丢它自己。 */
+          this.session.runs = d.runs.slice(-this.MAX_RUNS)
+            .map(r => { try { return this.cleanRun(r); } catch (e) { return null; } })
+            .filter(Boolean);
         }
       }
     } catch (e) { /* 本地存储不可用则仅内存记录 */ }
