@@ -720,22 +720,29 @@ const Telemetry = {
   cleanRun(r) {
     if (!r || typeof r !== "object") return null;
     if (!Number.isFinite(r.duration) || !Number.isFinite(r.distance)) return null;  // 面板对这两个没有兜底
-    const num = (v, dflt) => (Number.isFinite(v) ? v : dflt);
-    const numOrNull = (v) => (Number.isFinite(v) ? v : null);
+    /* 第 19 轮复审 P3：`Number.isFinite` 挡不住**超大有限值** —— 1e308 能通过清洗，
+       两条这样的记录就把点按总量加爆成 Infinity，于是 invalidRate / passRate 变 NaN、
+       avgHeight 变 Infinity，H 面板整屏汇总全是 NaN。所以数值字段除"有限"外还须**落在合理区间**：
+       计数非负且 ≤ 1e6（200 局也加不爆 2^53）、比值 ≤ 1、高度类 ≤ 屏高、时长 ≤ 1 天。 */
+    const CNT = 1e6, DAY = 86400, DIST = 1e6;
+    const num = (v, dflt, hi) => (Number.isFinite(v) && v >= 0 ? Math.min(v, hi) : dflt);
+    const numOrNull = (v, hi) => (Number.isFinite(v) && v >= 0 ? Math.min(v, hi) : null);
     const text = (v) => (v === undefined || v === null ? "" : String(v));
     const LEVELS = { ok: 1, warn: 1, bad: 1, hint: 1 };
     const diagnosis = (Array.isArray(r.diagnosis) ? r.diagnosis : [])
       .filter(v => v && typeof v === "object" && typeof v.text === "string")
       .map(v => ({ level: LEVELS[v.level] ? v.level : "hint", text: v.text }));
-    const heights = (Array.isArray(r.heights) ? r.heights : []).filter(Number.isFinite).slice(0, 4000);
+    const heights = (Array.isArray(r.heights) ? r.heights : [])
+      .filter(h => Number.isFinite(h) && h >= 0).map(h => Math.min(h, CFG.H)).slice(0, 4000);
     return {
       id: text(r.id), endedAt: text(r.endedAt), date: text(r.date), reason: text(r.reason),
-      duration: r.duration, distance: r.distance, heights: heights, diagnosis: diagnosis,
-      taps: num(r.taps, 0), invalid: num(r.invalid, 0), passed: num(r.passed, 0),
-      passRate: num(r.passRate, 0), mashRate: num(r.mashRate, 0), invalidRate: num(r.invalidRate, 0),
-      lowRatio: num(r.lowRatio, 0), ceilingRatio: num(r.ceilingRatio, 0),
-      avgHeight: numOrNull(r.avgHeight), firstReaction: numOrNull(r.firstReaction),
-      minGapSpire: numOrNull(r.minGapSpire), minGapPlate: numOrNull(r.minGapPlate)
+      duration: Math.min(Math.max(r.duration, 0), DAY), distance: Math.min(Math.max(r.distance, 0), DIST),
+      heights: heights, diagnosis: diagnosis,
+      taps: num(r.taps, 0, CNT), invalid: num(r.invalid, 0, CNT), passed: num(r.passed, 0, CNT),
+      passRate: num(r.passRate, 0, 1), mashRate: num(r.mashRate, 0, 1), invalidRate: num(r.invalidRate, 0, 1),
+      lowRatio: num(r.lowRatio, 0, 1), ceilingRatio: num(r.ceilingRatio, 0, 1),
+      avgHeight: numOrNull(r.avgHeight, CFG.H), firstReaction: numOrNull(r.firstReaction, DAY),
+      minGapSpire: numOrNull(r.minGapSpire, CFG.H), minGapPlate: numOrNull(r.minGapPlate, CFG.H)
     };
   },
 
@@ -749,7 +756,10 @@ const Telemetry = {
           this.session.startedAt = d.startedAt || new Date().toISOString();
           /* 逐条"洗"过再用：旧结构 / 被截断 / 被手工改过的记录会让 H 面板抛错或显示 NaN，
              具体洗哪些字段见 cleanRun() 的注释。本地存储不可用时仍然静默降级。 */
-          this.session.runs = d.runs.map(r => this.cleanRun(r)).filter(Boolean);
+          /* 也要**先截到 MAX_RUNS 再洗**（第 19 轮复审 P3）：只有 finishRun() 会裁剪，
+             而存档可能被手工改大 —— 一是汇总里的 Math.max(...arr) 在超大数组上会爆
+             运行时参数上限（H 面板直接抛错），二是启动时解析几千条记录纯属浪费。 */
+          this.session.runs = d.runs.slice(-this.MAX_RUNS).map(r => this.cleanRun(r)).filter(Boolean);
         }
       }
     } catch (e) { /* 本地存储不可用则仅内存记录 */ }
@@ -896,7 +906,9 @@ const Telemetry = {
       if (passRate < T.pass && passed <= 3) {
         v.push({ level: "bad", text: "早期就被障碍物撞死（仅通过 " + passed + " 个）—— 开局难度偏高：" +
           "建议放宽开局缝高上限（GAP_HI " + CFG.GAP_HI + " → " + Math.round(CFG.GAP_HI * 1.15) + "），" +
-          "或把难度达峰距离拉长（DIFF_RAMP " + CFG.DIFF_RAMP + "m → " + Math.round(CFG.DIFF_RAMP * 4 / 3) + "m）" });
+          "或把难度达峰距离拉长（DIFF_RAMP " + CFG.DIFF_RAMP + "m → " + Math.round(CFG.DIFF_RAMP * 4 / 3) +
+          "m，SPD_RAMP 要一起动 " + CFG.SPD_RAMP + " → " + Math.round(CFG.SPD_RAMP * 4 / 3) + "m，" +
+          "否则速度先达峰、后半程只剩难度在爬）" });
       } else {
         v.push({ level: "warn", text: "撞到障碍物（已通过 " + passed + " 个）—— 属于正常的读牌失误；" +
           "若这种死法占比超过一半，可考虑把反应余量 REACT 从 " + CFG.REACT.toFixed(2) + "s 提到 " +
@@ -981,7 +993,9 @@ const Telemetry = {
     if (n >= T.minRuns) {
       if (durMed < T.shortRun) {
         v.push({ level: "bad", text: "存活中位数仅 " + agg.durMed + "s（" + n + " 局）—— 整体偏难。" +
-          "按性价比排序：① 难度达峰 " + CFG.DIFF_RAMP + "m → " + Math.round(CFG.DIFF_RAMP * 4 / 3) + "m；" +
+          "按性价比排序：① 难度达峰 " + CFG.DIFF_RAMP + "m → " + Math.round(CFG.DIFF_RAMP * 4 / 3) + "m" +
+          "（SPD_RAMP 要同步 " + CFG.SPD_RAMP + " → " + Math.round(CFG.SPD_RAMP * 4 / 3) + "m，两个必须一起动，" +
+          "否则难度达峰与速度达峰会错开）；" +
           "② 组间距下限 GAP_MIN " + CFG.GAP_MIN.toFixed(2) + "s → " + (CFG.GAP_MIN + 0.2).toFixed(2) + "s；③ 降低 apex" });
       }
       if (ceilN >= n * 0.4) {
@@ -1021,17 +1035,26 @@ const Telemetry = {
     return agg;
   },
 
-  /* ---------- 导出（只含汇总，不含逐帧采样） ---------- */
-  exportPayload() {
+  /* ---------- 导出（只含汇总，不含逐帧采样） ----------
+     withAdvice = 是否带上**内部调参建议**（逐局 diagnosis + 汇总 verdicts）。
+     第 19 轮复审 P2：只在面板里藏起"自动诊断与调参建议"这个标题是不够的 ——
+     原始 JSON 预览与导出按钮走的是同一个函数，会把建议原样带出发布视图。
+     所以发布视图（链接不带 ?dev=1）导出的是**公开子集**：玩家的成绩数据照给，
+     内部调参结论一律不出厂。 */
+  exportPayload(withAdvice) {
     const compact = this.session.runs.map(r => {
-      const o = {}; for (const k in r) if (k !== "heights") o[k] = r[k]; return o;
+      const o = {};
+      for (const k in r) if (k !== "heights" && (withAdvice || k !== "diagnosis")) o[k] = r[k];
+      return o;
     });
+    const summary = this.sessionSummary();
+    if (summary && !withAdvice) delete summary.verdicts;      // 汇总里的调参结论同样不能出厂
     return JSON.stringify({
       schema: "hover-runner-telemetry/1",
       exportedAt: new Date().toISOString(),
       session: { sessionId: this.session.sessionId, startedAt: this.session.startedAt },
       config: this.session.config || this.configSnapshot(),
-      summary: this.sessionSummary(),
+      summary: summary,
       runs: compact
     }, null, 2);
   }
@@ -2387,6 +2410,10 @@ function renderTelemetryPanel() {
     "区间高度=" + c.gapHi + "→" + c.cap13 + "（屏高 " + (c.cap13 / CFG.H * 100).toFixed(1) + "%）　" +
     "难度达峰=" + c.diffRampM + "m（幂 " + c.diffPow + "）";
 
+  /* 预览与导出**共用同一份 payload**：两处各调一次 exportPayload() 的话，
+     哪天只给其中一处加参数就会漏 —— 第 19 轮复审抓到的"藏了标题、没藏数据"正是这种漏。 */
+  const payload = Telemetry.exportPayload(devOn());
+
   telEl.innerHTML =
     "<h3>游玩数据面板　<span class='hint'>（本局配置：" + cfgLine + "）</span></h3>" +
     "<div class='bar'>" +
@@ -2403,7 +2430,7 @@ function renderTelemetryPanel() {
       "<th>通过</th><th>有效点按</th><th>未生效点按</th><th>平均高度</th><th>柱间隙</th><th>板间隙</th>" +
     "</tr>" + rows + "</table>" +
     "<h3>原始数据预览（可直接复制给我）</h3>" +
-    "<pre>" + Telemetry.exportPayload().replace(/</g, "&lt;") + "</pre>";
+    "<pre>" + payload.replace(/</g, "&lt;") + "</pre>";
 
   telEl.classList.add("open");
   document.getElementById("telClose").onclick = () => { telOpen = true; toggleTelemetry(); };
@@ -2413,7 +2440,7 @@ function renderTelemetryPanel() {
     renderTelemetryPanel();
   };
   document.getElementById("telExport").onclick = () => {
-    const text = Telemetry.exportPayload();
+    const text = Telemetry.exportPayload(devOn());
     const done = () => { document.getElementById("telExport").textContent = "已复制 ✓"; };
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text).then(done, () => fallbackCopy(text, done));
